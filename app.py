@@ -3,8 +3,10 @@ app.py
 =============================================================================
 Streamlit Web Application for the Natural Language SQL Data Analyst Agent.
 Features:
-- Crisp, executive-clean light mode UI (#F8FAFC, slate typography, indigo accents)
-- High-level business KPI summary bar
+- Dynamic Multi-Database Connections (SQLite, Uploaded .db, PostgreSQL, MySQL)
+- Active engine stored in st.session_state & inspected dynamically via SQLAlchemy
+- Crisp executive-clean light mode UI (#F8FAFC, slate typography, indigo accents)
+- High-level business KPI summary bar (adapts to e-commerce or custom DBs)
 - Interactive database schema & data preview explorer in sidebar
 - Categorized prompt library & one-click Self-Correction demonstration
 - Collapsible Agent Thought Process Expander tracking LangGraph state transitions
@@ -307,9 +309,10 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # 2. Application State Management
 # =============================================================================
 
-if "db_initialized" not in st.session_state:
-    database.init_database()
-    st.session_state.db_initialized = True
+if "db_engine" not in st.session_state:
+    st.session_state.db_engine = database.get_default_engine()
+    st.session_state.db_type = "SQLite (Default)"
+    st.session_state.db_label = "Built-in E-Commerce (analytics.db)"
 
 if "last_query" not in st.session_state:
     st.session_state.last_query = ""
@@ -331,7 +334,7 @@ def set_query(query_text: str):
 
 
 # =============================================================================
-# 3. Sidebar: Configuration, Schema Inspector & Prompt Library
+# 3. Sidebar: Multi-Database Connections, Settings & Dynamic Schema Explorer
 # =============================================================================
 
 with st.sidebar:
@@ -341,14 +344,150 @@ with st.sidebar:
         <div style="background: linear-gradient(135deg, #4F46E5, #3B82F6); width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: white; font-size: 1.3rem; font-weight: bold;">⚡</div>
         <div>
             <h3 style="margin: 0; font-size: 1.15rem; font-weight: 700; color: #0F172A;">DataPulse AI</h3>
-            <span style="font-size: 0.75rem; color: #64748B; font-weight: 500;">LangGraph SQL Analyst</span>
+            <span style="font-size: 0.75rem; color: #64748B; font-weight: 500;">Multi-DB LangGraph Analyst</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("<hr style='margin: 0.75rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
+    # Active Database Indicator Badge
+    curr_dialect = st.session_state.db_engine.dialect.name.upper()
+    st.markdown(f"""
+    <div style="margin-top: 0.4rem; margin-bottom: 0.6rem;">
+        <span class="pill-badge pill-emerald">● Active: {curr_dialect}</span>
+        <div style="font-size: 0.75rem; color: #64748B; margin-top: 0.25rem;">{st.session_state.db_label}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # 1. LLM & Endpoint Settings
+    st.markdown("<hr style='margin: 0.5rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
+
+    # 1. Multi-Database Connection Manager
+    with st.expander("🗄️ Database Connection Manager", expanded=False):
+        db_source = st.selectbox(
+            "Connection Mode",
+            [
+                "Default Demo DB (analytics.db)",
+                "Upload Custom SQLite File (.db)",
+                "PostgreSQL",
+                "MySQL",
+                "Custom SQLAlchemy URI"
+            ],
+            index=0
+        )
+
+        if db_source == "Default Demo DB (analytics.db)":
+            st.caption("Realistic synthetic enterprise dataset (60 customers, 25 products, 160 orders).")
+            if st.button("🔄 Reset to Default Demo DB", key="btn_reset_default_db", use_container_width=True):
+                st.session_state.db_engine = database.get_default_engine()
+                st.session_state.db_type = "SQLite (Default)"
+                st.session_state.db_label = "Built-in E-Commerce (analytics.db)"
+                st.session_state.agent_output = None
+                st.success("Connected to default analytics.db!")
+                st.rerun()
+
+        elif db_source == "Upload Custom SQLite File (.db)":
+            st.caption("Upload any SQLite database file (.db, .sqlite, .sqlite3).")
+            uploaded_db = st.file_uploader(
+                "Choose an SQLite file",
+                type=["db", "sqlite", "sqlite3"],
+                key="uploader_sqlite_file"
+            )
+            if uploaded_db is not None:
+                os.makedirs("uploads", exist_ok=True)
+                save_path = os.path.join("uploads", uploaded_db.name)
+                with open(save_path, "wb") as f:
+                    f.write(uploaded_db.getbuffer())
+
+                if st.button(f"⚡ Connect to {uploaded_db.name}", key="btn_connect_uploaded", use_container_width=True):
+                    try:
+                        new_engine = database.create_custom_engine(f"sqlite:///{os.path.abspath(save_path)}")
+                        ok, msg = database.test_engine_connection(new_engine)
+                        if ok:
+                            st.session_state.db_engine = new_engine
+                            st.session_state.db_type = "SQLite (Uploaded)"
+                            st.session_state.db_label = f"Uploaded: {uploaded_db.name}"
+                            st.session_state.agent_output = None
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(f"Connection test failed: {msg}")
+                    except Exception as err:
+                        st.error(f"Error loading uploaded database: {str(err)}")
+
+        elif db_source == "PostgreSQL":
+            st.caption("Connect to a PostgreSQL database instance.")
+            pg_host = st.text_input("Host", value="localhost", key="pg_host")
+            pg_port = st.number_input("Port", value=5432, step=1, key="pg_port")
+            pg_db = st.text_input("Database Name", value="analytics", key="pg_db")
+            pg_user = st.text_input("Username", value="postgres", key="pg_user")
+            pg_pass = st.text_input("Password", type="password", key="pg_pass")
+
+            if st.button("🐘 Connect to PostgreSQL", key="btn_connect_pg", use_container_width=True):
+                try:
+                    uri = database.build_connection_uri("postgresql", pg_host, int(pg_port), pg_db, pg_user, pg_pass)
+                    new_engine = database.create_custom_engine(uri)
+                    ok, msg = database.test_engine_connection(new_engine)
+                    if ok:
+                        st.session_state.db_engine = new_engine
+                        st.session_state.db_type = "PostgreSQL"
+                        st.session_state.db_label = f"PostgreSQL ({pg_db}@{pg_host})"
+                        st.session_state.agent_output = None
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(f"Connection failed: {msg}")
+                except Exception as err:
+                    st.error(f"Failed to create PostgreSQL engine: {str(err)}")
+
+        elif db_source == "MySQL":
+            st.caption("Connect to a MySQL database instance.")
+            my_host = st.text_input("Host", value="localhost", key="my_host")
+            my_port = st.number_input("Port", value=3306, step=1, key="my_port")
+            my_db = st.text_input("Database Name", value="analytics", key="my_db")
+            my_user = st.text_input("Username", value="root", key="my_user")
+            my_pass = st.text_input("Password", type="password", key="my_pass")
+
+            if st.button("🐬 Connect to MySQL", key="btn_connect_mysql", use_container_width=True):
+                try:
+                    uri = database.build_connection_uri("mysql", my_host, int(my_port), my_db, my_user, my_pass)
+                    new_engine = database.create_custom_engine(uri)
+                    ok, msg = database.test_engine_connection(new_engine)
+                    if ok:
+                        st.session_state.db_engine = new_engine
+                        st.session_state.db_type = "MySQL"
+                        st.session_state.db_label = f"MySQL ({my_db}@{my_host})"
+                        st.session_state.agent_output = None
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(f"Connection failed: {msg}")
+                except Exception as err:
+                    st.error(f"Failed to create MySQL engine: {str(err)}")
+
+        elif db_source == "Custom SQLAlchemy URI":
+            st.caption("Direct SQLAlchemy connection string.")
+            custom_uri = st.text_input(
+                "Connection URI",
+                value="sqlite:///analytics.db",
+                placeholder="postgresql+psycopg2://user:pass@host:5432/dbname",
+                key="custom_uri_input"
+            )
+            if st.button("🔗 Connect via URI", key="btn_connect_uri", use_container_width=True):
+                try:
+                    new_engine = database.create_custom_engine(custom_uri.strip())
+                    ok, msg = database.test_engine_connection(new_engine)
+                    if ok:
+                        st.session_state.db_engine = new_engine
+                        st.session_state.db_type = new_engine.dialect.name.upper()
+                        st.session_state.db_label = f"Custom URI ({new_engine.dialect.name})"
+                        st.session_state.agent_output = None
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(f"Connection failed: {msg}")
+                except Exception as err:
+                    st.error(f"Engine creation failed: {str(err)}")
+
+    # 2. LLM & Inference Settings
     with st.expander("⚙️ LLM & Engine Settings", expanded=False):
         provider = st.selectbox(
             "Inference Engine",
@@ -361,7 +500,6 @@ with st.sidebar:
         selected_model = "gpt-4o-mini"
 
         if provider == "OpenAI / Direct Key":
-            # Check environment variables and Streamlit Cloud secrets
             default_key = os.getenv("OPENAI_API_KEY", "")
             if not default_key:
                 try:
@@ -389,66 +527,23 @@ with st.sidebar:
 
         else:
             st.markdown('<span class="pill-badge pill-emerald">● Built-in Deterministic Engine</span>', unsafe_allow_html=True)
-            st.caption("Operates 100% offline using the analytical benchmark catalog.")
+            st.caption("Operates offline using the analytical benchmark catalog.")
 
-    # 2. Executive Prompt Library
-    st.markdown("<p style='font-size: 0.82rem; font-weight: 700; color: #334155; text-transform: uppercase; letter-spacing: 0.05em; margin: 0.75rem 0 0.35rem 0;'>Executive Prompt Library</p>", unsafe_allow_html=True)
+    # 3. Dynamic Database Schema Explorer
+    st.markdown("<p style='font-size: 0.82rem; font-weight: 700; color: #334155; text-transform: uppercase; letter-spacing: 0.05em; margin: 0.75rem 0 0.35rem 0;'>Inspected Database Schema</p>", unsafe_allow_html=True)
 
-    prompt_category = st.radio(
-        "Prompt Category",
-        ["Revenue & Sales", "Customers", "Categories & Margins", "Operations"],
-        horizontal=True,
-        label_visibility="collapsed"
-    )
-
-    if prompt_category == "Revenue & Sales":
-        prompts = [
-            "What are the top 5 revenue generating products?",
-            "Show monthly sales trends by customer segment",
-            "Top 10 enterprise and SMB accounts by lifetime spend"
-        ]
-    elif prompt_category == "Customers":
-        prompts = [
-            "Which region has the highest average order value?",
-            "Breakdown of customer signups across segments",
-            "Top 10 enterprise and SMB accounts by lifetime spend"
-        ]
-    elif prompt_category == "Categories & Margins":
-        prompts = [
-            "Compare profit margin percentage by category",
-            "What are the top 5 revenue generating products?"
-        ]
-    else:
-        prompts = [
-            "Breakdown of order volume by fulfillment status",
-            "Transaction volume by payment method"
-        ]
-
-    for p in prompts:
-        if st.button(p, key=f"btn_p_{p}", use_container_width=True):
-            set_query(p)
-
-    # 3. Intentional Self-Correction Demonstration Button
-    st.markdown("<div style='margin-top: 0.65rem;'></div>", unsafe_allow_html=True)
-    if st.button("🧪 Test Self-Correction Loop", key="btn_test_error", use_container_width=True):
-        set_query("Test self-correction: Select client_name and total sales from client_records")
-
-    st.markdown("<hr style='margin: 1rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
-
-    # 4. Active Database Schema Explorer with Row Previews
-    st.markdown("<p style='font-size: 0.82rem; font-weight: 700; color: #334155; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;'>Active SQLite Schema</p>", unsafe_allow_html=True)
-
-    schema_meta = database.get_schema_metadata()
-    total_records = sum(info["row_count"] for info in schema_meta.values())
+    active_meta = database.get_engine_schema_metadata(st.session_state.db_engine)
+    total_db_rows = sum(m["row_count"] for m in active_meta.values() if m["row_count"] > 0)
 
     st.markdown(f"""
     <div style="font-size: 0.78rem; color: #64748B; margin-bottom: 0.6rem;">
-        Database: <code>analytics.db</code> &bull; <strong>{len(schema_meta)}</strong> tables &bull; <strong>{total_records:,}</strong> total rows
+        Dialect: <code>{curr_dialect}</code> &bull; <strong>{len(active_meta)}</strong> tables &bull; <strong>{total_db_rows:,}</strong> total rows
     </div>
     """, unsafe_allow_html=True)
 
-    for table_name, meta in schema_meta.items():
-        with st.expander(f"📁 {table_name} ({meta['row_count']} rows)", expanded=False):
+    for table_name, meta in active_meta.items():
+        row_label = f"{meta['row_count']} rows" if meta['row_count'] >= 0 else "live"
+        with st.expander(f"📁 {table_name} ({row_label})", expanded=False):
             col_data = []
             for col in meta["columns"]:
                 col_data.append({
@@ -458,25 +553,39 @@ with st.sidebar:
                 })
             st.dataframe(pd.DataFrame(col_data), use_container_width=True, hide_index=True)
 
-            # Table Preview inside expander
             try:
-                preview_df = database.get_table_preview(table_name, limit=3)
+                preview_df = database.get_engine_table_preview(st.session_state.db_engine, table_name, limit=3)
                 st.caption("Sample 3 Rows:")
                 st.dataframe(preview_df, use_container_width=True, hide_index=True)
             except Exception:
                 pass
 
-    # Database Re-seed Button
-    if st.button("🔄 Reset / Re-seed Database", key="btn_reseed", use_container_width=True):
-        database.init_database(force_recreate=True)
-        st.success("Database re-seeded with fresh sample data!")
-        st.rerun()
+    st.markdown("<hr style='margin: 0.75rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
 
-    # Query History
+    # 4. Prompt Suggestions & Test Triggers
+    st.markdown("<p style='font-size: 0.82rem; font-weight: 700; color: #334155; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;'>Sample Analytical Prompts</p>", unsafe_allow_html=True)
+
+    prompts = [
+        "What are the top 5 revenue generating products?",
+        "Show monthly sales trends by customer segment",
+        "Which region has the highest average order value?",
+        "Compare profit margin percentage by category",
+        "Breakdown of order volume by fulfillment status",
+        "Top 10 enterprise and SMB accounts by lifetime spend"
+    ]
+
+    for p in prompts:
+        if st.button(p, key=f"btn_p_{p}", use_container_width=True):
+            set_query(p)
+
+    st.markdown("<div style='margin-top: 0.5rem;'></div>", unsafe_allow_html=True)
+    if st.button("🧪 Test Self-Correction Loop", key="btn_test_error", use_container_width=True):
+        set_query("Test self-correction: Select client_name and total sales from client_records")
+
     if st.session_state.query_history:
-        st.markdown("<hr style='margin: 1rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
+        st.markdown("<hr style='margin: 0.75rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
         st.markdown("<p style='font-size: 0.82rem; font-weight: 700; color: #334155; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;'>Recent Queries</p>", unsafe_allow_html=True)
-        for h_q in reversed(st.session_state.query_history[-4:]):
+        for h_q in reversed(st.session_state.query_history[-3:]):
             if st.button(f"⏱️ {h_q[:35]}...", key=f"hist_{h_q}", use_container_width=True):
                 set_query(h_q)
 
@@ -486,7 +595,7 @@ with st.sidebar:
 # =============================================================================
 
 # Hero Banner
-st.markdown("""
+st.markdown(f"""
 <div class="exec-card" style="border-top: 4px solid #4F46E5; background: linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%); margin-bottom: 1rem;">
     <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem;">
         <div>
@@ -494,12 +603,12 @@ st.markdown("""
                 Natural Language SQL Data Analyst Agent
             </h1>
             <p style="font-size: 0.95rem; color: #475569; margin: 0; line-height: 1.5;">
-                Autonomous LangGraph multi-stage state machine with self-correction, dynamic schema grounding, and interactive Plotly visualization.
+                Autonomous LangGraph multi-stage state machine with self-correction, dynamic SQLAlchemy schema grounding, and interactive Plotly visualization.
             </p>
         </div>
         <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-            <span class="pill-badge pill-indigo">LangGraph State Machine</span>
-            <span class="pill-badge pill-emerald">SQLite Read-Only</span>
+            <span class="pill-badge pill-indigo">LangGraph 0.2</span>
+            <span class="pill-badge pill-emerald">{curr_dialect} Engine</span>
             <span class="pill-badge pill-amber">Self-Correction Guard</span>
         </div>
     </div>
@@ -507,27 +616,50 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Executive KPI Summary Bar
-db_metrics = database.get_db_metrics()
-st.markdown(f"""
-<div class="kpi-container">
-    <div class="kpi-card">
-        <div class="kpi-label">Enterprise Gross Revenue</div>
-        <div class="kpi-value">${db_metrics['total_revenue']:,.2f}</div>
+db_metrics = database.get_engine_metrics(st.session_state.db_engine)
+
+if db_metrics.get("is_ecommerce", False):
+    st.markdown(f"""
+    <div class="kpi-container">
+        <div class="kpi-card">
+            <div class="kpi-label">Enterprise Gross Revenue</div>
+            <div class="kpi-value">${db_metrics['total_revenue']:,.2f}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Completed Orders</div>
+            <div class="kpi-value">{db_metrics['completed_orders']:,}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Active Customer Accounts</div>
+            <div class="kpi-value">{db_metrics['total_customers']}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Average Order Value (AOV)</div>
+            <div class="kpi-value">${db_metrics['avg_order_value']:,.2f}</div>
+        </div>
     </div>
-    <div class="kpi-card">
-        <div class="kpi-label">Completed Orders</div>
-        <div class="kpi-value">{db_metrics['completed_orders']:,}</div>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown(f"""
+    <div class="kpi-container">
+        <div class="kpi-card">
+            <div class="kpi-label">Connected Database Dialect</div>
+            <div class="kpi-value">{db_metrics['dialect'].upper()}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Inspected User Tables</div>
+            <div class="kpi-value">{db_metrics['total_tables']}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Estimated Total Rows</div>
+            <div class="kpi-value">{db_metrics['total_rows']:,}</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Connection Mode</div>
+            <div class="kpi-value" style="font-size: 1.1rem;">{st.session_state.db_type}</div>
+        </div>
     </div>
-    <div class="kpi-card">
-        <div class="kpi-label">Active Customer Accounts</div>
-        <div class="kpi-value">{db_metrics['total_customers']}</div>
-    </div>
-    <div class="kpi-card">
-        <div class="kpi-label">Average Order Value (AOV)</div>
-        <div class="kpi-value">${db_metrics['avg_order_value']:,.2f}</div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 
 # Query Input Form
@@ -553,7 +685,7 @@ with col_rnd:
             "Which region has the highest average order value?",
             "Compare profit margin percentage by category",
             "Breakdown of order volume by fulfillment status",
-            "Transaction volume by payment method"
+            "Top 10 enterprise and SMB accounts by lifetime spend"
         ]
         set_query(random.choice(random_options))
 
@@ -568,14 +700,15 @@ if st.session_state.get("auto_submit", False):
 # =============================================================================
 
 if should_run and user_query.strip():
-    with st.spinner("LangGraph agent orchestrating query generation, execution, and synthesis..."):
+    with st.spinner(f"LangGraph agent orchestrating analysis on {curr_dialect} engine..."):
         try:
             active_key = api_key_input.strip() if api_key_input else None
             state_result = agent.run_analyst_pipeline(
                 user_query=user_query.strip(),
                 api_key=active_key,
                 model=selected_model,
-                base_url=base_url_input
+                base_url=base_url_input,
+                engine=st.session_state.db_engine
             )
             st.session_state.agent_output = state_result
             st.session_state.last_query = user_query.strip()
@@ -599,16 +732,16 @@ if output:
     retry_count = output.get("retry_count", 0)
     has_self_correction = retry_count > 0
 
-    expander_title = f"🧠 Agent Reasoning & State Trajectory ({len(thought_steps)} Steps"
+    expander_title = f"🧠 Agent Reasoning & State Trajectory ({len(thought_steps)} Steps • {curr_dialect}"
     if has_self_correction:
         expander_title += f" &bull; ⚠️ {retry_count} Self-Correction Loop{'s' if retry_count > 1 else ''} Triggered)"
     else:
         expander_title += " &bull; ✅ Flawless Execution)"
 
     with st.expander(expander_title, expanded=True):
-        st.markdown("""
+        st.markdown(f"""
         <div style="font-size: 0.85rem; color: #64748B; margin-bottom: 0.85rem;">
-            Inspect each state transition in the LangGraph workflow: query formulation, execution benchmark, runtime error capture, self-correction, and visual synthesis.
+            Inspect each state transition in the LangGraph workflow: query formulation, execution benchmark, runtime error capture, self-correction, and visual synthesis grounded in <code>{curr_dialect}</code>.
         </div>
         """, unsafe_allow_html=True)
 
@@ -680,12 +813,11 @@ if output:
     # Tab 1: Executive Briefing & Visualization
     # ---------------------------------------------------------
     with tab_vis:
-        # Narrative Insight Card
         st.markdown(f"""
         <div class="exec-card" style="border-left: 5px solid #2563EB;">
             <div class="exec-card-header">
                 <span style="font-weight: 700; font-size: 1.05rem; color: #0F172A;">📊 Executive Business Insights</span>
-                <span class="pill-badge pill-indigo">Automated Synthesis</span>
+                <span class="pill-badge pill-indigo">Automated Synthesis • {curr_dialect}</span>
             </div>
             <div style="font-size: 0.95rem; color: #334155; line-height: 1.6;">
                 {explanation}
@@ -694,7 +826,6 @@ if output:
         </div>
         """, unsafe_allow_html=True)
 
-        # Query-specific KPIs
         if kpis:
             kpi_cols = st.columns(len(kpis))
             for i, k in enumerate(kpis):
@@ -706,13 +837,12 @@ if output:
                     </div>
                     """, unsafe_allow_html=True)
 
-        # Interactive Plotly Chart
         if not df.empty and chart_spec:
             c_type = chart_spec.get("chart_type", "bar")
             x_col = chart_spec.get("x")
             y_col = chart_spec.get("y")
             color_col = chart_spec.get("color")
-            title = chart_spec.get("title", "Visual Analysis")
+            title = chart_spec.get("title", f"Visual Analysis ({curr_dialect})")
 
             if x_col not in df.columns:
                 x_col = df.columns[0]
@@ -840,9 +970,9 @@ if output:
     # Tab 3: Executed SQL & Query Plan
     # ---------------------------------------------------------
     with tab_sql:
-        st.markdown("""
+        st.markdown(f"""
         <div style="font-size: 0.88rem; color: #475569; margin-bottom: 0.5rem;">
-            Verified SQLite syntax produced and validated by the LangGraph agent state machine:
+            Verified <code>{curr_dialect}</code> syntax synthesized and validated by the LangGraph state machine:
         </div>
         """, unsafe_allow_html=True)
         st.code(sql_query, language="sql")
@@ -850,10 +980,11 @@ if output:
         exec_time = output.get("execution_time_ms", 0.0)
         retries = output.get("retry_count", 0)
         st.markdown(f"""
-        <div style="display: flex; gap: 0.75rem; margin-top: 0.5rem;">
+        <div style="display: flex; gap: 0.75rem; margin-top: 0.5rem; flex-wrap: wrap;">
             <span class="pill-badge pill-indigo">⏱️ Execution Time: {exec_time} ms</span>
             <span class="pill-badge pill-emerald">🔄 Attempts: {retries + 1}</span>
-            <span class="pill-badge pill-indigo">Database: analytics.db</span>
+            <span class="pill-badge pill-indigo">Engine: {curr_dialect}</span>
+            <span class="pill-badge pill-indigo">Target: {st.session_state.db_label}</span>
         </div>
         """, unsafe_allow_html=True)
 
@@ -861,38 +992,38 @@ if output:
     # Tab 4: Direct SQL Sandbox (For Evaluators)
     # ---------------------------------------------------------
     with tab_sandbox:
-        st.markdown("""
+        st.markdown(f"""
         <div style="font-size: 0.88rem; color: #475569; margin-bottom: 0.75rem;">
-            Academic evaluators may test and cross-verify direct read-only SQL queries against <code>analytics.db</code>:
+            Academic evaluators may test and cross-verify direct read-only SQL queries against active <code>{curr_dialect}</code> engine:
         </div>
         """, unsafe_allow_html=True)
 
         sandbox_sql = st.text_area(
-            "Execute Raw SQL Query:",
+            f"Execute Raw {curr_dialect} Query:",
             value=sql_query,
             height=120,
             key="sandbox_sql_input"
         )
         if st.button("⚡ Execute Custom Query", key="btn_run_sandbox"):
             try:
-                s_df, s_dur = database.execute_query(sandbox_sql)
+                s_df, s_dur = database.execute_engine_query(sandbox_sql, st.session_state.db_engine)
                 st.success(f"Query returned {len(s_df)} row(s) in {s_dur} ms.")
                 st.dataframe(s_df, use_container_width=True)
             except Exception as sb_err:
                 st.error(f"Execution Error: {str(sb_err)}")
 
 elif not output and not should_run:
-    st.markdown("""
+    st.markdown(f"""
     <div class="exec-card" style="text-align: center; padding: 3rem 1.5rem; margin-top: 1rem;">
         <div style="font-size: 2.5rem; margin-bottom: 0.75rem;">⚡</div>
-        <h3 style="font-size: 1.25rem; font-weight: 700; color: #0F172A; margin: 0 0 0.5rem 0;">Ready to Analyze Your Data</h3>
+        <h3 style="font-size: 1.25rem; font-weight: 700; color: #0F172A; margin: 0 0 0.5rem 0;">Ready to Analyze Your Data ({curr_dialect})</h3>
         <p style="font-size: 0.9rem; color: #64748B; max-width: 600px; margin: 0 auto 1.5rem auto; line-height: 1.5;">
-            Type any analytical inquiry in the box above or choose a curated executive prompt from the sidebar to observe the LangGraph agent generate queries, execute against SQLite, self-correct errors, and synthesize interactive visuals.
+            Type any analytical inquiry in the box above or choose a curated executive prompt from the sidebar to observe the LangGraph agent generate queries, execute against {curr_dialect}, self-correct errors, and synthesize interactive visuals.
         </p>
         <div style="display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap;">
-            <span class="pill-badge pill-indigo">Pydantic LLM Output</span>
+            <span class="pill-badge pill-indigo">Dynamic inspect(engine)</span>
             <span class="pill-badge pill-amber">Automated Retry Loop</span>
-            <span class="pill-badge pill-emerald">Interactive Plotly Visuals</span>
+            <span class="pill-badge pill-emerald">Multi-DB Compatible</span>
         </div>
     </div>
     """, unsafe_allow_html=True)

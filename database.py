@@ -1,40 +1,343 @@
 """
 database.py
 =============================================================================
-SQLite Database Manager & Synthetic Enterprise Analytics Engine.
+Dynamic Multi-Database Engine & Schema Inspector (SQLAlchemy 2.0).
 
-Provides:
-- Fully normalized relational schema (Categories, Customers, Products, Orders, Order Items)
-- Deterministic synthetic dataset (60 customers, 25 products, 160 orders, 450 items)
-- Safe read-only SQL query execution with runtime benchmarking
-- Dynamic DDL & sample data extraction for LLM prompt context
-- Metadata & table preview utilities for Streamlit UI inspection
+Supports:
+- Dynamic connection switching (SQLite, PostgreSQL, MySQL, Custom URIs)
+- File uploads for custom SQLite .db files
+- Dynamic schema introspection using SQLAlchemy `inspect(engine)`
+- Dialect-aware DDL extraction (column types, primary keys, foreign keys)
+- Safe read-only execution benchmarking with execution time tracking
+- Default seeded SQLite database for instant zero-config demonstrations
 =============================================================================
 """
 
 import os
+import re
+import time
 import sqlite3
 import random
-import time
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
+
 import pandas as pd
+from sqlalchemy import create_engine, inspect, text, Engine
 
 DEFAULT_DB_PATH = "analytics.db"
+_ENGINE_CACHE: Dict[str, Engine] = {}
 
+
+# =============================================================================
+# 1. SQLAlchemy Engine Factory & Connection Management
+# =============================================================================
+
+def get_sqlite_engine(db_path: str = DEFAULT_DB_PATH) -> Engine:
+    """Returns a cached SQLAlchemy engine for a local SQLite database."""
+    global _ENGINE_CACHE
+    init_database(db_path)
+    normalized_path = os.path.abspath(db_path)
+    if normalized_path not in _ENGINE_CACHE:
+        _ENGINE_CACHE[normalized_path] = create_engine(
+            f"sqlite:///{normalized_path}",
+            connect_args={"check_same_thread": False}
+        )
+    return _ENGINE_CACHE[normalized_path]
+
+
+def get_default_engine(db_path: str = DEFAULT_DB_PATH) -> Engine:
+    """Returns the cached engine for the default local SQLite database."""
+    return get_sqlite_engine(db_path)
+
+
+def dispose_engine(db_path_or_uri: str) -> None:
+    """Disposes cached engine connection pool to release file locks on Windows."""
+    global _ENGINE_CACHE
+    norm = os.path.abspath(db_path_or_uri)
+    if norm in _ENGINE_CACHE:
+        try:
+            _ENGINE_CACHE[norm].dispose()
+        except Exception:
+            pass
+        del _ENGINE_CACHE[norm]
+
+
+def create_custom_engine(connection_uri: str) -> Engine:
+    """
+    Creates and returns a new SQLAlchemy Engine from a connection URI.
+    Supports SQLite, PostgreSQL (psycopg2/psycopg), MySQL (pymysql), etc.
+    """
+    # SQLite specific configuration
+    if connection_uri.startswith("sqlite"):
+        return create_engine(connection_uri, connect_args={"check_same_thread": False})
+
+    # PostgreSQL / MySQL connection pool configuration
+    return create_engine(
+        connection_uri,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10
+    )
+
+
+def build_connection_uri(
+    db_type: str,
+    host: str = "localhost",
+    port: int = 5432,
+    database: str = "analytics",
+    username: str = "postgres",
+    password: str = ""
+) -> str:
+    """Constructs a standardized, URL-encoded SQLAlchemy connection string."""
+    encoded_user = urllib.parse.quote_plus(username)
+    encoded_pass = urllib.parse.quote_plus(password)
+
+    db_lower = db_type.lower()
+    if "postgres" in db_lower:
+        return f"postgresql+psycopg2://{encoded_user}:{encoded_pass}@{host}:{port}/{database}"
+    elif "mysql" in db_lower:
+        return f"mysql+pymysql://{encoded_user}:{encoded_pass}@{host}:{port}/{database}"
+    elif "sqlite" in db_lower:
+        return f"sqlite:///{database}"
+    else:
+        raise ValueError(f"Unsupported database type: '{db_type}'. Choose PostgreSQL, MySQL, or SQLite.")
+
+
+def test_engine_connection(engine: Engine) -> Tuple[bool, str]:
+    """
+    Tests whether the engine can successfully connect and execute a lightweight ping.
+    Returns (is_successful, message).
+    """
+    try:
+        with engine.connect() as conn:
+            # Universal test query across SQL dialects
+            conn.execute(text("SELECT 1"))
+        insp = inspect(engine)
+        table_count = len(insp.get_table_names())
+        dialect = engine.dialect.name
+        return True, f"Connected successfully to {dialect.upper()} database. Found {table_count} table(s)."
+    except Exception as err:
+        return False, str(err)
+
+
+# =============================================================================
+# 2. Dynamic Schema Introspection using SQLAlchemy inspect(engine)
+# =============================================================================
+
+def get_engine_schema_string(engine: Engine, sample_rows_count: int = 2) -> str:
+    """
+    Dynamically inspects the connected database and returns a rich, structured
+    DDL representation with column types, primary keys, foreign keys, and sample rows.
+    Automatically adapts to SQLite, PostgreSQL, and MySQL dialects.
+    """
+    insp = inspect(engine)
+    dialect_name = engine.dialect.name.upper()
+    table_names = insp.get_table_names()
+
+    if not table_names:
+        return f"-- {dialect_name} Database: Connected successfully, but no user tables were found."
+
+    schema_lines = [
+        f"-- {dialect_name} Relational Database Schema Definition",
+        f"-- Total Tables Detected: {len(table_names)}",
+        ""
+    ]
+
+    with engine.connect() as conn:
+        for t in table_names:
+            cols = insp.get_columns(t)
+            pk_info = insp.get_pk_constraint(t)
+            pk_cols = set(pk_info.get("constrained_columns") or [])
+            fk_info = insp.get_foreign_keys(t)
+
+            schema_lines.append(f"CREATE TABLE {t} (")
+            col_defs = []
+            for col in cols:
+                col_name = col["name"]
+                col_type = str(col["type"])
+                is_pk = " PRIMARY KEY" if col_name in pk_cols else ""
+                nullable = "" if col.get("nullable", True) else " NOT NULL"
+                col_defs.append(f"    {col_name} {col_type}{is_pk}{nullable}")
+
+            # Add Foreign Key constraints
+            for fk in fk_info:
+                from_cols = ", ".join(fk["constrained_columns"])
+                ref_tbl = fk["referred_table"]
+                ref_cols = ", ".join(fk["referred_columns"])
+                col_defs.append(f"    FOREIGN KEY ({from_cols}) REFERENCES {ref_tbl} ({ref_cols})")
+
+            schema_lines.append(",\n".join(col_defs))
+            schema_lines.append(");")
+
+            # Fetch sample rows
+            try:
+                # Wrap table name safely
+                quoted_table = f'"{t}"' if dialect_name == "POSTGRESQL" else f"`{t}`" if dialect_name == "MYSQL" else t
+                sample_query = text(f"SELECT * FROM {quoted_table} LIMIT {sample_rows_count}")
+                df_sample = pd.read_sql_query(sample_query, conn)
+                if not df_sample.empty:
+                    schema_lines.append(f"-- Example rows from '{t}':")
+                    for _, r in df_sample.iterrows():
+                        schema_lines.append(f"-- Sample: {r.to_dict()}")
+            except Exception:
+                pass
+
+            schema_lines.append("")
+
+    return "\n".join(schema_lines)
+
+
+def get_engine_schema_metadata(engine: Engine) -> Dict[str, Any]:
+    """
+    Returns structured metadata for the Streamlit sidebar schema viewer:
+    table names, column details, types, primary keys, and exact row counts.
+    """
+    insp = inspect(engine)
+    table_names = insp.get_table_names()
+    dialect_name = engine.dialect.name.upper()
+    metadata = {}
+
+    with engine.connect() as conn:
+        for t in table_names:
+            cols = insp.get_columns(t)
+            pk_info = insp.get_pk_constraint(t)
+            pk_cols = set(pk_info.get("constrained_columns") or [])
+
+            columns = []
+            for c in cols:
+                columns.append({
+                    "name": c["name"],
+                    "type": str(c["type"]),
+                    "pk": c["name"] in pk_cols
+                })
+
+            # Row count calculation
+            row_count = 0
+            try:
+                quoted = f'"{t}"' if dialect_name == "POSTGRESQL" else f"`{t}`" if dialect_name == "MYSQL" else t
+                res = conn.execute(text(f"SELECT COUNT(*) FROM {quoted}"))
+                row_count = res.scalar() or 0
+            except Exception:
+                row_count = -1
+
+            metadata[t] = {
+                "columns": columns,
+                "row_count": row_count
+            }
+
+    return metadata
+
+
+def get_engine_table_preview(engine: Engine, table_name: str, limit: int = 3) -> pd.DataFrame:
+    """Returns a preview DataFrame for a specific table in the connected engine."""
+    insp = inspect(engine)
+    if table_name not in insp.get_table_names():
+        raise ValueError(f"Table '{table_name}' does not exist in the active database.")
+
+    dialect_name = engine.dialect.name.upper()
+    quoted = f'"{table_name}"' if dialect_name == "POSTGRESQL" else f"`{table_name}`" if dialect_name == "MYSQL" else table_name
+
+    with engine.connect() as conn:
+        df = pd.read_sql_query(text(f"SELECT * FROM {quoted} LIMIT {int(limit)}"), conn)
+        return df
+
+
+def get_engine_metrics(engine: Engine) -> Dict[str, Any]:
+    """
+    Returns dynamic high-level statistics for the active database engine.
+    If default e-commerce tables exist, computes commercial KPIs; otherwise returns structural KPIs.
+    """
+    insp = inspect(engine)
+    tables = insp.get_table_names()
+    dialect = engine.dialect.name
+
+    # Check for e-commerce tables
+    has_ecommerce = {"orders", "customers", "order_items"}.issubset(set(tables))
+
+    if has_ecommerce:
+        with engine.connect() as conn:
+            try:
+                c_cust = conn.execute(text("SELECT COUNT(*) FROM customers")).scalar() or 0
+                c_orders = conn.execute(text("SELECT COUNT(*) FROM orders WHERE status != 'Cancelled'")).scalar() or 0
+                rev = conn.execute(text("""
+                    SELECT ROUND(SUM(oi.total_price), 2)
+                    FROM order_items oi
+                    JOIN orders o ON oi.order_id = o.order_id
+                    WHERE o.status != 'Cancelled'
+                """)).scalar() or 0.0
+                c_prod = conn.execute(text("SELECT COUNT(*) FROM products")).scalar() or 0
+                aov = round(rev / c_orders, 2) if c_orders > 0 else 0.0
+
+                return {
+                    "is_ecommerce": True,
+                    "total_revenue": rev,
+                    "completed_orders": c_orders,
+                    "total_customers": c_cust,
+                    "total_products": c_prod,
+                    "avg_order_value": aov,
+                    "dialect": dialect,
+                    "table_count": len(tables)
+                }
+            except Exception:
+                pass
+
+    # Generic database metrics
+    total_rows = 0
+    with engine.connect() as conn:
+        for t in tables[:15]:
+            try:
+                quoted = f'"{t}"' if dialect == "postgresql" else f"`{t}`" if dialect == "mysql" else t
+                cnt = conn.execute(text(f"SELECT COUNT(*) FROM {quoted}")).scalar() or 0
+                total_rows += cnt
+            except Exception:
+                pass
+
+    return {
+        "is_ecommerce": False,
+        "total_tables": len(tables),
+        "total_rows": total_rows,
+        "dialect": dialect,
+        "tables": tables
+    }
+
+
+def execute_engine_query(sql: str, engine: Engine) -> Tuple[pd.DataFrame, float]:
+    """
+    Executes a read-only query against the active SQLAlchemy Engine,
+    benchmarks execution duration in milliseconds, and returns (DataFrame, duration_ms).
+    """
+    start_time = time.perf_counter()
+
+    # Prevent harmful mutating queries
+    stripped = sql.strip().upper()
+    forbidden_keywords = [
+        "DROP", "DELETE", "TRUNCATE", "ALTER", "INSERT", "UPDATE",
+        "REPLACE", "CREATE", "ATTACH", "DETACH", "GRANT", "REVOKE"
+    ]
+    first_token = stripped.split()[0] if stripped.split() else ""
+    if first_token in forbidden_keywords or any(f" {kw} " in f" {stripped} " for kw in ["DROP TABLE", "DELETE FROM", "UPDATE "]):
+        raise ValueError(f"Security Alert: Operation '{first_token}' is rejected. Only read-only SELECT queries are allowed.")
+
+    with engine.connect() as conn:
+        df = pd.read_sql_query(text(sql), conn)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        return df, round(elapsed_ms, 2)
+
+
+# =============================================================================
+# 3. Default SQLite Initialization & Deterministic Seeder
+# =============================================================================
 
 def get_db_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    """Creates and returns a connection to the SQLite database."""
+    """Legacy helper: returns a raw sqlite3 connection."""
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) -> None:
-    """
-    Initializes the SQLite database with rich synthetic enterprise data
-    if it does not exist or if force_recreate is True.
-    """
+    """Initializes the default local SQLite database with realistic enterprise data."""
     if os.path.exists(db_path) and not force_recreate:
         try:
             conn = get_db_connection(db_path)
@@ -47,7 +350,6 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
         except Exception:
             pass
 
-    # Remove existing db file if forced
     if force_recreate and os.path.exists(db_path):
         try:
             os.remove(db_path)
@@ -56,11 +358,8 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
 
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
-
-    # Enable foreign keys
     cursor.execute("PRAGMA foreign_keys = ON;")
 
-    # 1. Categories Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS categories (
         category_id INTEGER PRIMARY KEY,
@@ -69,7 +368,6 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
     );
     """)
 
-    # 2. Customers Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS customers (
         customer_id INTEGER PRIMARY KEY,
@@ -81,7 +379,6 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
     );
     """)
 
-    # 3. Products Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS products (
         product_id INTEGER PRIMARY KEY,
@@ -94,7 +391,6 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
     );
     """)
 
-    # 4. Orders Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         order_id INTEGER PRIMARY KEY,
@@ -108,7 +404,6 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
     );
     """)
 
-    # 5. Order Items Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS order_items (
         item_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +417,6 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
     );
     """)
 
-    # Create Indexes for Query Optimization
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_customers_segment_region ON customers(segment, region);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_customer_date ON orders(customer_id, order_date);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
@@ -130,18 +424,15 @@ def init_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = False) 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);")
 
     conn.commit()
-
-    # Seed data
     _populate_sample_data(conn)
     conn.close()
 
 
 def _populate_sample_data(conn: sqlite3.Connection) -> None:
-    """Populates realistic, deterministic e-commerce & enterprise data."""
+    """Populates deterministic synthetic enterprise data."""
     cursor = conn.cursor()
     rng = random.Random(42)
 
-    # Categories Data
     categories = [
         (1, "Enterprise Software", "Technology"),
         (2, "Hardware & Devices", "Technology"),
@@ -151,33 +442,27 @@ def _populate_sample_data(conn: sqlite3.Connection) -> None:
     ]
     cursor.executemany("INSERT INTO categories VALUES (?, ?, ?)", categories)
 
-    # Products Data (25 items)
     products = [
-        # Enterprise Software
         (101, 1, "ERP Cloud Suite", 12500.00, 3500.00, 100),
         (102, 1, "CRM Intelligence Pro", 4800.00, 1100.00, 150),
         (103, 1, "BI Analytics Studio", 3200.00, 800.00, 200),
         (104, 1, "HR & Payroll Engine", 2100.00, 500.00, 180),
         (105, 1, "Financial Ledger API", 5500.00, 1200.00, 120),
-        # Hardware & Devices
         (201, 2, "UltraBook Developer Edition", 1899.00, 1250.00, 85),
         (202, 2, "4K Ergonomic Studio Monitor", 799.00, 480.00, 140),
         (203, 2, "AI Edge Server Node", 4500.00, 2900.00, 45),
         (204, 2, "Wireless Mechanical Keyboard", 189.00, 95.00, 300),
         (205, 2, "Noise-Cancelling Executive Headset", 349.00, 180.00, 220),
-        # Cloud Infrastructure
         (301, 3, "Kubernetes Dedicated Cluster", 8500.00, 3100.00, 60),
         (302, 3, "Managed Vector Database Tier", 2400.00, 750.00, 120),
         (303, 3, "High-Throughput Object Store", 1500.00, 420.00, 250),
         (304, 3, "Global CDN & Edge Compute", 1950.00, 600.00, 180),
         (305, 3, "Serverless Compute Pool", 3100.00, 950.00, 140),
-        # Office & Workstations
         (401, 4, "Motorized Dual-Motor Standing Desk", 950.00, 520.00, 75),
         (402, 4, "Aeron Ergonomic Task Chair", 1200.00, 680.00, 90),
         (403, 4, "Conference Room Smart Display 65-inch", 2499.00, 1600.00, 35),
         (404, 4, "Acoustic Focus Privacy Pod", 4200.00, 2600.00, 20),
         (405, 4, "Docking Station Thunderbolt 4", 280.00, 140.00, 210),
-        # Cybersecurity & Identity
         (501, 5, "Zero-Trust Identity Broker", 6200.00, 1800.00, 80),
         (502, 5, "Next-Gen Firewall Appliance", 3800.00, 2100.00, 55),
         (503, 5, "Endpoint Detection & Response (EDR)", 2900.00, 900.00, 110),
@@ -186,7 +471,6 @@ def _populate_sample_data(conn: sqlite3.Connection) -> None:
     ]
     cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?)", products)
 
-    # Customers Data (60 customers)
     customer_first_names = [
         "Alex", "David", "Elena", "Sophia", "Marcus", "Emily", "Liam", "Olivia",
         "Vikram", "Chloe", "Mateo", "Priya", "Carlos", "Aria", "Ethan", "Fatima",
@@ -208,7 +492,6 @@ def _populate_sample_data(conn: sqlite3.Connection) -> None:
 
     segments = ["Enterprise", "SMB", "Consumer"]
     segment_weights = [0.35, 0.45, 0.20]
-
     regions = ["North America", "Europe", "Asia-Pacific", "Latin America"]
     region_weights = [0.45, 0.30, 0.18, 0.07]
 
@@ -236,10 +519,8 @@ def _populate_sample_data(conn: sqlite3.Connection) -> None:
 
     cursor.executemany("INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)", customers)
 
-    # Orders & Order Items Data (160 orders, ~450 items)
     statuses = ["Completed", "Shipped", "Pending", "Cancelled"]
     status_weights = [0.75, 0.15, 0.06, 0.04]
-
     payment_methods = ["Credit Card", "Wire Transfer", "ACH", "PayPal"]
     payment_weights = [0.45, 0.30, 0.15, 0.10]
 
@@ -276,149 +557,43 @@ def _populate_sample_data(conn: sqlite3.Connection) -> None:
 
     cursor.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?)", orders)
     cursor.executemany("INSERT INTO order_items VALUES (?, ?, ?, ?, ?, ?)", order_items)
-
     conn.commit()
 
 
+# =============================================================================
+# 4. Backwards Compatibility Wrappers (for existing tests & scripts)
+# =============================================================================
+
 def get_schema_string(db_path: str = DEFAULT_DB_PATH) -> str:
-    """
-    Returns clean, comprehensive DDL statements and sample rows for LLM prompting.
-    """
-    init_database(db_path)
-    conn = get_db_connection(db_path)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-    tables = cursor.fetchall()
-
-    schema_lines = ["-- SQLite Database Schema Definition"]
-    for table_name, sql in tables:
-        schema_lines.append(f"\n{sql};")
-
-        cursor.execute(f"SELECT * FROM {table_name} LIMIT 2")
-        rows = cursor.fetchall()
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        col_names = [col[1] for col in cursor.fetchall()]
-
-        if rows:
-            schema_lines.append(f"-- Example rows from '{table_name}':")
-            schema_lines.append(f"-- Columns: {', '.join(col_names)}")
-            for r in rows:
-                schema_lines.append(f"-- Sample: {dict(zip(col_names, r))}")
-
-    conn.close()
-    return "\n".join(schema_lines)
+    engine = get_default_engine(db_path)
+    return get_engine_schema_string(engine)
 
 
 def get_schema_metadata(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
-    """
-    Returns structured metadata of all tables, columns, and row counts
-    for Streamlit sidebar visual inspection.
-    """
-    init_database(db_path)
-    conn = get_db_connection(db_path)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-    table_names = [row[0] for row in cursor.fetchall()]
-
-    metadata = {}
-    for t in table_names:
-        cursor.execute(f"PRAGMA table_info({t})")
-        columns = [{"name": c[1], "type": c[2], "pk": bool(c[5])} for c in cursor.fetchall()]
-        cursor.execute(f"SELECT COUNT(*) FROM {t}")
-        count = cursor.fetchone()[0]
-        metadata[t] = {
-            "columns": columns,
-            "row_count": count
-        }
-
-    conn.close()
-    return metadata
+    engine = get_default_engine(db_path)
+    return get_engine_schema_metadata(engine)
 
 
 def get_table_preview(table_name: str, limit: int = 5, db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
-    """Returns a preview DataFrame of the requested table."""
-    init_database(db_path)
-    conn = get_db_connection(db_path)
-    try:
-        # Validate table name to avoid injection
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
-        if not cursor.fetchone():
-            raise ValueError(f"Table '{table_name}' does not exist.")
-        df = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT {int(limit)}", conn)
-        return df
-    finally:
-        conn.close()
+    engine = get_default_engine(db_path)
+    return get_engine_table_preview(engine, table_name, limit)
 
 
 def get_db_metrics(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
-    """Returns high-level business intelligence metrics from the database."""
-    init_database(db_path)
-    conn = get_db_connection(db_path)
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT COUNT(*) FROM customers")
-        total_customers = cursor.fetchone()[0]
-
-        cursor.execute("SELECT COUNT(*) FROM orders WHERE status != 'Cancelled'")
-        completed_orders = cursor.fetchone()[0]
-
-        cursor.execute("""
-            SELECT ROUND(SUM(oi.total_price), 2)
-            FROM order_items oi
-            JOIN orders o ON oi.order_id = o.order_id
-            WHERE o.status != 'Cancelled'
-        """)
-        total_revenue = cursor.fetchone()[0] or 0.0
-
-        cursor.execute("SELECT COUNT(*) FROM products")
-        total_products = cursor.fetchone()[0]
-
-        avg_order_value = round(total_revenue / completed_orders, 2) if completed_orders > 0 else 0.0
-
-        return {
-            "total_revenue": total_revenue,
-            "completed_orders": completed_orders,
-            "total_customers": total_customers,
-            "total_products": total_products,
-            "avg_order_value": avg_order_value
-        }
-    finally:
-        conn.close()
+    engine = get_default_engine(db_path)
+    return get_engine_metrics(engine)
 
 
 def execute_query(sql: str, db_path: str = DEFAULT_DB_PATH) -> Tuple[pd.DataFrame, float]:
-    """
-    Executes a SQL query against SQLite, enforces safety guardrails,
-    and returns (DataFrame, execution_duration_ms).
-    Raises Exception on syntax or execution failure.
-    """
-    start_time = time.perf_counter()
-    conn = get_db_connection(db_path)
-    try:
-        # Prevent harmful or mutating queries
-        stripped = sql.strip().upper()
-        forbidden_keywords = [
-            "DROP", "DELETE", "TRUNCATE", "ALTER", "INSERT", "UPDATE",
-            "REPLACE", "CREATE", "ATTACH", "DETACH", "PRAGMA"
-        ]
-        first_token = stripped.split()[0] if stripped.split() else ""
-        if first_token in forbidden_keywords or any(f" {kw} " in f" {stripped} " for kw in ["DROP TABLE", "DELETE FROM", "UPDATE "]):
-            raise ValueError(f"Security Alert: Mutating operation '{first_token}' is not permitted. Only read-only SELECT queries are allowed.")
-
-        df = pd.read_sql_query(sql, conn)
-        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-        return df, round(elapsed_ms, 2)
-    finally:
-        conn.close()
+    engine = get_default_engine(db_path)
+    return execute_engine_query(sql, engine)
 
 
 if __name__ == "__main__":
     init_database(force_recreate=True)
-    print("Database initialized successfully.")
-    metrics = get_db_metrics()
-    print("DB Metrics:", metrics)
-    df, duration = execute_query("SELECT c.segment, COUNT(o.order_id) as orders FROM customers c JOIN orders o ON c.customer_id = o.customer_id GROUP BY c.segment")
-    print(f"Sample Query ({duration}ms):\n", df)
+    engine = get_default_engine()
+    print("Testing dynamic SQLAlchemy inspection on default engine:")
+    print(get_engine_schema_string(engine)[:500])
+    print("\nMetrics:", get_engine_metrics(engine))
+    df, dur = execute_engine_query("SELECT customer_id, name FROM customers LIMIT 3", engine)
+    print(f"\nSample Query ({dur} ms):\n", df)

@@ -20,6 +20,7 @@ def setup_test_db():
     """Initializes a fresh test database and cleans up after tests."""
     database.init_database(db_path=TEST_DB_PATH, force_recreate=True)
     yield
+    database.dispose_engine(TEST_DB_PATH)
     if os.path.exists(TEST_DB_PATH):
         try:
             os.remove(TEST_DB_PATH)
@@ -92,6 +93,34 @@ def test_db_metrics():
     assert metrics["total_customers"] == 60
     assert metrics["total_products"] == 25
     assert metrics["avg_order_value"] > 0
+
+
+def test_dynamic_sqlalchemy_engine():
+    """Verify dynamic SQLAlchemy engine creation, inspection, and execution."""
+    # 1. Test build_connection_uri
+    pg_uri = database.build_connection_uri("postgresql", "db.example.com", 5432, "my_db", "user1", "pass123")
+    assert "postgresql+psycopg2://" in pg_uri
+    assert "user1:pass123@db.example.com:5432/my_db" in pg_uri
+
+    mysql_uri = database.build_connection_uri("mysql", "localhost", 3306, "warehouse", "root", "secret")
+    assert "mysql+pymysql://" in mysql_uri
+
+    # 2. Test custom engine on SQLite
+    engine = database.create_custom_engine(f"sqlite:///{TEST_DB_PATH}")
+    ok, msg = database.test_engine_connection(engine)
+    assert ok is True
+    assert "Found 5 table(s)" in msg
+
+    # 3. Test dynamic inspection
+    meta = database.get_engine_schema_metadata(engine)
+    assert len(meta) == 5
+    assert "customers" in meta
+    assert len(meta["customers"]["columns"]) == 6
+
+    # 4. Test dynamic execution
+    df, dur = database.execute_engine_query("SELECT customer_id, name FROM customers LIMIT 2", engine)
+    assert len(df) == 2
+    assert dur >= 0.0
 
 
 if __name__ == "__main__":

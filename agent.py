@@ -1,14 +1,13 @@
 """
 agent.py
 =============================================================================
-LangGraph State Machine with Self-Correction Loop for Natural Language
-to SQL Data Analytics.
+LangGraph State Machine with Self-Correction Loop for Multi-Database Analytics.
 
 Architecture:
   [User Query] 
        │
        ▼
-  [generate_query] 
+  [generate_query] ◄── Dynamic SQLAlchemy inspect(engine) Schema DDL
        │
        ▼
   [execute_query] ──────(Error & retry < 3)──────► [self_correct]
@@ -32,6 +31,7 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Literal, Tuple
 from pydantic import BaseModel, Field
 import pandas as pd
+from sqlalchemy import Engine
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
@@ -49,7 +49,7 @@ class SQLQueryOutput(BaseModel):
     """Pydantic schema for initial SQL query generation."""
     sql_query: str = Field(
         ...,
-        description="The clean, executable SQLite SELECT query answering the user's question. Do not include markdown ticks."
+        description="The clean, executable SQL SELECT query answering the user's question, matching the target dialect. Do not include markdown ticks."
     )
     query_rationale: str = Field(
         ...,
@@ -69,7 +69,7 @@ class SQLCorrectionOutput(BaseModel):
     """Pydantic schema for query self-correction."""
     corrected_sql_query: str = Field(
         ...,
-        description="The corrected, executable SQLite SELECT query resolving the syntax or schema error."
+        description="The corrected, executable SQL SELECT query resolving the syntax or schema error."
     )
     error_diagnosis: str = Field(
         ...,
@@ -144,7 +144,9 @@ class AgentState(TypedDict):
     kpis: Optional[List[Dict[str, Any]]]
     thought_steps: List[Dict[str, Any]]
     execution_time_ms: float
-    db_path: str
+    db_engine: Optional[Any]   # Active SQLAlchemy Engine
+    db_dialect: str           # 'sqlite', 'postgresql', 'mysql'
+    db_path: str              # Legacy fallback path
 
 
 # =============================================================================
@@ -180,7 +182,7 @@ def clean_sql_string(raw_sql: str) -> str:
 
 
 # =============================================================================
-# 4. Rich Analytical Rule Engine for Demonstration & Offline Robustness
+# 4. Analytical Catalog for Demonstration & Offline Robustness
 # =============================================================================
 
 ANALYTICAL_CATALOG = [
@@ -307,7 +309,7 @@ ORDER BY total_transactions DESC;""",
 ]
 
 
-def heuristic_generate_sql(user_query: str) -> Dict[str, Any]:
+def heuristic_generate_sql(user_query: str, engine: Optional[Engine] = None) -> Dict[str, Any]:
     """Generates a contextual SQL query if no active LLM API key is present."""
     q_lower = user_query.lower()
 
@@ -320,6 +322,7 @@ def heuristic_generate_sql(user_query: str) -> Dict[str, Any]:
             "chart_type": "bar"
         }
 
+    # Match analytical catalog if e-commerce database is active
     for item in ANALYTICAL_CATALOG:
         if any(kw in q_lower for kw in item["keywords"]):
             return {
@@ -333,7 +336,28 @@ def heuristic_generate_sql(user_query: str) -> Dict[str, Any]:
                 "title": item.get("title")
             }
 
-    # Dynamic fallback query
+    # If custom database is active, inspect its first table
+    if engine is not None:
+        try:
+            insp = database.inspect(engine)
+            tables = insp.get_table_names()
+            if tables:
+                t = tables[0]
+                cols = [c["name"] for c in insp.get_columns(t)]
+                quoted = f'"{t}"' if engine.dialect.name == "postgresql" else f"`{t}`" if engine.dialect.name == "mysql" else t
+                return {
+                    "sql": f"SELECT * FROM {quoted} LIMIT 25;",
+                    "rationale": f"Extracted initial preview records from discovered table '{t}' in {engine.dialect.name.upper()} database.",
+                    "tables": [t],
+                    "chart_type": "table",
+                    "x": cols[0] if cols else None,
+                    "y": None,
+                    "title": f"Preview of {t}"
+                }
+        except Exception:
+            pass
+
+    # Generic fallback query
     return {
         "sql": """SELECT c.segment, c.region, COUNT(DISTINCT o.order_id) AS total_orders, ROUND(SUM(oi.total_price), 2) AS revenue
 FROM customers c
@@ -352,7 +376,7 @@ ORDER BY revenue DESC;""",
     }
 
 
-def heuristic_self_correct(failed_sql: str, error_msg: str, user_query: str) -> Dict[str, Any]:
+def heuristic_self_correct(failed_sql: str, error_msg: str, user_query: str, engine: Optional[Engine] = None) -> Dict[str, Any]:
     """Deterministic correction for simulated error testing."""
     if "client_records" in failed_sql or "non_existent_column" in failed_sql:
         corrected = """SELECT c.name AS customer_name, c.segment, ROUND(SUM(oi.total_price), 2) AS total_spend
@@ -365,10 +389,11 @@ ORDER BY total_spend DESC
 LIMIT 8;"""
         return {
             "sql": corrected,
-            "diagnosis": "The previous query referenced a non-existent table 'client_records' and invalid column 'order_val'. Fixed by joining verified tables 'customers', 'orders', and 'order_items'.",
+            "diagnosis": "The previous query referenced a non-existent table 'client_records'. Corrected by querying verified tables 'customers', 'orders', and 'order_items'.",
             "fix": "Replaced non-existent relation with valid customer spend aggregation."
         }
 
+    # Generic replacement
     return {
         "sql": """SELECT p.product_name, ROUND(SUM(oi.total_price), 2) AS revenue
 FROM order_items oi
@@ -390,10 +415,13 @@ def create_agent_nodes(llm: Optional[ChatOpenAI] = None):
     """Factory returning the node execution functions for the LangGraph StateMachine."""
 
     def generate_query(state: AgentState) -> Dict[str, Any]:
-        """Node 1: generate_query - Translates user query into verified SQLite query."""
+        """Node 1: generate_query - Translates user query into verified SQL using dynamic inspect(engine)."""
         user_query = state["user_query"]
-        db_path = state.get("db_path", database.DEFAULT_DB_PATH)
-        schema_str = database.get_schema_string(db_path)
+        engine: Engine = state.get("db_engine") or database.get_default_engine(state.get("db_path", database.DEFAULT_DB_PATH))
+        dialect = engine.dialect.name.upper()
+
+        # Dynamic schema extraction via inspect(engine)
+        schema_str = database.get_engine_schema_string(engine)
         thought_steps = list(state.get("thought_steps", []))
         timestamp = datetime.now().strftime("%H:%M:%S")
 
@@ -404,7 +432,7 @@ def create_agent_nodes(llm: Optional[ChatOpenAI] = None):
                 "step": "Generating SQL Query",
                 "status": "warning",
                 "time": timestamp,
-                "title": "1. SQL Generation (Self-Correction Demonstration)",
+                "title": f"1. SQL Generation (Self-Correction Demonstration • {dialect})",
                 "detail": "Deliberately injecting non-existent table 'client_records' to demonstrate LangGraph's automated error interception and recovery loop.",
                 "sql": bad_sql,
                 "tables_used": ["client_records (faulty)"]
@@ -419,16 +447,17 @@ def create_agent_nodes(llm: Optional[ChatOpenAI] = None):
         if llm:
             try:
                 system_prompt = f"""You are an elite SQL Data Analyst and Database Architect.
-Generate an accurate, highly optimized SQLite query that directly answers the user's business question.
+TARGET DATABASE ENGINE: {dialect}
+Generate an accurate, highly optimized SQL query matching the {dialect} dialect that answers the user's inquiry.
 
-DATABASE SCHEMA:
+DATABASE SCHEMA (INSPECTED LIVE FROM ACTIVE DATABASE):
 {schema_str}
 
 CRITICAL RULES:
 1. ONLY produce SELECT queries. Do not generate DROP, DELETE, INSERT, or UPDATE statements.
-2. Use valid SQLite functions (e.g., strftime('%Y-%m', date_col) for month extraction, ROUND(..., 2) for decimals).
+2. Adhere strictly to {dialect} syntax and functions (e.g., in SQLite use strftime('%Y-%m', col), in Postgres use TO_CHAR(col, 'YYYY-MM'), in MySQL use DATE_FORMAT(col, '%Y-%m')).
 3. Always qualify columns with table aliases when joining multiple tables.
-4. Exclude cancelled orders (o.status != 'Cancelled') when analyzing revenue or order performance unless explicitly requested.
+4. Exclude cancelled orders where applicable (e.g., status != 'Cancelled').
 5. Provide clear, descriptive column aliases in the SELECT clause."""
 
                 structured_llm = llm.with_structured_output(SQLQueryOutput)
@@ -442,7 +471,7 @@ CRITICAL RULES:
                     "step": "Generating SQL Query",
                     "status": "success",
                     "time": timestamp,
-                    "title": "1. SQL Generation (LLM Reasoning)",
+                    "title": f"1. SQL Generation (LLM Reasoning • {dialect})",
                     "detail": result.query_rationale,
                     "tables_used": result.tables_used,
                     "sql": clean_sql
@@ -457,12 +486,12 @@ CRITICAL RULES:
                 pass
 
         # Heuristic / Offline fallback
-        h_res = heuristic_generate_sql(user_query)
+        h_res = heuristic_generate_sql(user_query, engine=engine)
         thought_steps.append({
             "step": "Generating SQL Query",
             "status": "success",
             "time": timestamp,
-            "title": "1. SQL Generation (Analytical Parser)",
+            "title": f"1. SQL Generation (Analytical Parser • {dialect})",
             "detail": h_res["rationale"],
             "tables_used": h_res.get("tables", []),
             "sql": h_res["sql"]
@@ -475,19 +504,21 @@ CRITICAL RULES:
         }
 
     def execute_query(state: AgentState) -> Dict[str, Any]:
-        """Node 2: execute_query - Runs SQL against SQLite with performance timing & traceback capture."""
+        """Node 2: execute_query - Runs SQL against active engine with performance benchmarking & traceback capture."""
         sql_query = state["sql_query"]
-        db_path = state.get("db_path", database.DEFAULT_DB_PATH)
+        engine: Engine = state.get("db_engine") or database.get_default_engine(state.get("db_path", database.DEFAULT_DB_PATH))
+        dialect = engine.dialect.name.upper()
+
         thought_steps = list(state.get("thought_steps", []))
         timestamp = datetime.now().strftime("%H:%M:%S")
 
         try:
-            df, duration_ms = database.execute_query(sql_query, db_path)
+            df, duration_ms = database.execute_engine_query(sql_query, engine)
             thought_steps.append({
                 "step": "Executing Query",
                 "status": "success",
                 "time": timestamp,
-                "title": f"2. Query Execution Success (Attempt {state.get('retry_count', 0) + 1})",
+                "title": f"2. Query Execution Success (Attempt {state.get('retry_count', 0) + 1} • {dialect})",
                 "detail": f"Database executed query successfully in {duration_ms} ms. Retrieved {len(df)} rows across {len(df.columns)} columns.",
                 "rows_retrieved": len(df),
                 "columns": list(df.columns),
@@ -507,8 +538,8 @@ CRITICAL RULES:
                 "step": "Executing Query",
                 "status": "error",
                 "time": timestamp,
-                "title": f"2. Query Execution Failure (Attempt {state.get('retry_count', 0) + 1})",
-                "detail": f"SQLite execution failed: {short_err}",
+                "title": f"2. Query Execution Failure (Attempt {state.get('retry_count', 0) + 1} • {dialect})",
+                "detail": f"{dialect} execution failed: {short_err}",
                 "error_traceback": err_tb,
                 "failed_sql": sql_query
             })
@@ -520,20 +551,24 @@ CRITICAL RULES:
             }
 
     def self_correct(state: AgentState) -> Dict[str, Any]:
-        """Node 3: self_correct - Intercepts error traceback and rewrites the SQL query."""
+        """Node 3: self_correct - Intercepts error traceback and rewrites the SQL query for the active dialect."""
         user_query = state["user_query"]
         failed_sql = state["sql_query"]
         error_msg = state.get("execution_error", "Unknown Execution Error")
         retry_count = state.get("retry_count", 0) + 1
-        db_path = state.get("db_path", database.DEFAULT_DB_PATH)
-        schema_str = database.get_schema_string(db_path)
+
+        engine: Engine = state.get("db_engine") or database.get_default_engine(state.get("db_path", database.DEFAULT_DB_PATH))
+        dialect = engine.dialect.name.upper()
+        schema_str = database.get_engine_schema_string(engine)
+
         thought_steps = list(state.get("thought_steps", []))
         timestamp = datetime.now().strftime("%H:%M:%S")
 
         if llm:
             try:
-                system_prompt = f"""You are an expert SQLite Query Debugger and Self-Correction Agent.
-A previously generated query failed with a runtime error. Inspect the schema and traceback to write a corrected query.
+                system_prompt = f"""You are an expert SQL Query Debugger and Self-Correction Agent.
+TARGET DATABASE ENGINE: {dialect}
+A previously generated query failed with a runtime error. Inspect the schema and traceback to write a corrected query adhering to {dialect} rules.
 
 DATABASE SCHEMA:
 {schema_str}
@@ -548,8 +583,8 @@ USER GOAL:
 {user_query}
 
 INSTRUCTIONS:
-1. Identify the exact root cause (missing table/column, invalid GROUP BY, aggregate syntax).
-2. Rewrite the query strictly adhering to verified schema tables.
+1. Identify the exact root cause (column/table mismatch, missing join, aggregate error, syntax incompatible with {dialect}).
+2. Rewrite the query strictly adhering to verified schema tables and {dialect} functions.
 3. Keep the query read-only (SELECT only)."""
 
                 structured_llm = llm.with_structured_output(SQLCorrectionOutput)
@@ -563,7 +598,7 @@ INSTRUCTIONS:
                     "step": "Self-Correction Loop",
                     "status": "corrected",
                     "time": timestamp,
-                    "title": f"3. Self-Correction Triggered (Retry {retry_count}/3)",
+                    "title": f"3. Self-Correction Triggered (Retry {retry_count}/3 • {dialect})",
                     "detail": f"Diagnosis: {correction.error_diagnosis}\nFix Applied: {correction.fix_applied}",
                     "sql": clean_corrected_sql
                 })
@@ -577,12 +612,12 @@ INSTRUCTIONS:
                 pass
 
         # Heuristic correction fallback
-        h_corr = heuristic_self_correct(failed_sql, error_msg, user_query)
+        h_corr = heuristic_self_correct(failed_sql, error_msg, user_query, engine=engine)
         thought_steps.append({
             "step": "Self-Correction Loop",
             "status": "corrected",
             "time": timestamp,
-            "title": f"3. Self-Correction Triggered (Retry {retry_count}/3)",
+            "title": f"3. Self-Correction Triggered (Retry {retry_count}/3 • {dialect})",
             "detail": f"Diagnosis: {h_corr['diagnosis']}\nFix Applied: {h_corr['fix']}",
             "sql": h_corr["sql"]
         })
@@ -653,7 +688,7 @@ Generate:
                 chart_spec = {
                     "chart_type": vis_output.chart_type,
                     "x": vis_output.x_column if vis_output.x_column in df.columns else (df.columns[0] if len(df.columns) > 0 else None),
-                    "y": vis_output.y_column if vis_output.y_column in df.columns else (df.columns[1] if len(df.columns) > 1 else None),
+                    "y": vis_output.y_column if vis_output.y_column in df.columns else (df.columns[1] if len(df.columns) > 1 else df.columns[0]),
                     "color": vis_output.color_column if vis_output.color_column in df.columns else None,
                     "title": vis_output.chart_title,
                     "takeaway": vis_output.key_takeaway
@@ -807,12 +842,7 @@ def infer_visualization_heuristic(df: pd.DataFrame, user_query: str) -> Tuple[Di
 # =============================================================================
 
 def should_continue(state: AgentState) -> str:
-    """
-    Conditional routing edge after `execute_query`:
-    - If execution succeeded: route to `synthesize_and_visualize`.
-    - If execution failed and retry_count < 3: route to `self_correct`.
-    - If retry_count >= 3: route to `synthesize_and_visualize` with error notes.
-    """
+    """Conditional routing edge after `execute_query`."""
     execution_error = state.get("execution_error")
     retry_count = state.get("retry_count", 0)
 
@@ -859,11 +889,15 @@ def run_analyst_pipeline(
     api_key: Optional[str] = None,
     model: str = "gpt-4o-mini",
     base_url: Optional[str] = None,
+    engine: Optional[Engine] = None,
     db_path: str = database.DEFAULT_DB_PATH
 ) -> AgentState:
-    """Convenience orchestrator executing the end-to-end LangGraph pipeline."""
+    """Convenience orchestrator executing the end-to-end LangGraph pipeline with dynamic engine."""
     llm = get_llm(api_key=api_key, model=model, base_url=base_url)
     app = build_analyst_graph(llm=llm)
+
+    active_engine = engine or database.get_default_engine(db_path)
+    dialect_name = active_engine.dialect.name if hasattr(active_engine, "dialect") else "sqlite"
 
     initial_state: AgentState = {
         "user_query": user_query,
@@ -877,6 +911,8 @@ def run_analyst_pipeline(
         "kpis": [],
         "thought_steps": [],
         "execution_time_ms": 0.0,
+        "db_engine": active_engine,
+        "db_dialect": dialect_name,
         "db_path": db_path
     }
 
@@ -885,8 +921,10 @@ def run_analyst_pipeline(
 
 
 if __name__ == "__main__":
-    print("Testing LangGraph Analyst Pipeline...")
-    res = run_analyst_pipeline("What are the top 5 revenue generating products?")
-    print(f"Generated SQL:\n{res['sql_query']}")
+    print("Testing LangGraph Multi-Database Pipeline with SQLAlchemy Engine...")
+    default_eng = database.get_default_engine()
+    res = run_analyst_pipeline("What are the top 5 revenue generating products?", engine=default_eng)
+    print(f"Generated SQL ({res['db_dialect'].upper()}):\n{res['sql_query']}")
+    print(f"\nExecution Time: {res['execution_time_ms']} ms")
     print(f"\nKPIs: {res['kpis']}")
     print(f"\nTakeaway: {res['chart_spec']['takeaway']}")
