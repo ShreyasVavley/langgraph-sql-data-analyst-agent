@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2%2B-indigo.svg)](https://github.com/langchain-ai/langgraph)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.40%2B-FF4B4B.svg)](https://streamlit.io/)
-[![Tests](https://img.shields.io/badge/Tests-14%2F14%20Passing-emerald.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-19%2F19%20Passing-emerald.svg)]()
 [![Deploy to Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/deploy?repository=ShreyasVavley/langgraph-sql-data-analyst-agent&branch=main&mainModule=app.py)
 [![License](https://img.shields.io/badge/License-MIT-slate.svg)]()
 
@@ -60,43 +60,51 @@ A production-ready, highly polished **Natural Language to SQL Data Analyst Agent
 
 ---
 
-## 🚀 All Phases Completed
+## 🚀 Engineering Phases Completed
 
-### Phase 1: Database & Relational Foundation (`database.py`)
-- Normalized 5-table enterprise relational database (`categories`, `customers`, `products`, `orders`, `order_items`).
-- Deterministic synthetic dataset featuring 60 customers, 25 products, 160 orders, and 450 order items across 2024–2026.
-- SQLite query optimization with indices on high-cardinality foreign keys and dates.
-- High-level business intelligence metrics aggregator (`total_revenue`, `completed_orders`, `total_customers`, `avg_order_value`).
-- Safe execution wrapper enforcing read-only `SELECT` queries with sub-millisecond execution benchmarking.
+### Phase 1: Dynamic Multi-Database Engine & Introspection (`database.py`)
+- **SQLAlchemy 2.0 Engine Factory**: Seamless dynamic connection switching across SQLite, PostgreSQL, MySQL, and arbitrary connection URIs.
+- **Dynamic Schema Introspection**: Direct `inspect(engine)` extraction of table schemas, column data types, nullability, primary key constraints, foreign key references, and 2 sample rows per table.
+- **Schema RAG & Table Pruning**: Automatically tokenizes user inquiries and ranks/prunes large enterprise schemas (>15 tables) while preserving foreign key relational join paths to prevent prompt token bloat.
+- **Production Guardrails**:
+  - Read-only execution safety rejecting mutating statements (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`, `PRAGMA`).
+  - Automatic `LIMIT 1000` query pagination clamping to prevent memory exhaustion on runaway queries.
+  - Multi-threaded 15-second statement execution timeout enforcement.
+- **Deterministic E-Commerce Benchmark**: Seeded 5-table SQLite database (60 customers, 25 products, 160 orders, 450 order items across 2024–2026) for zero-configuration offline evaluation.
 
-### Phase 2: LangGraph State Machine & Multi-Model Engine (`agent.py`)
-- Pydantic v2 schemas: `SQLQueryOutput`, `SQLCorrectionOutput`, and `VisualizationInsightOutput` with embedded `KPIMetric` cards.
-- Multi-provider flexibility: Works with direct OpenAI keys, custom local endpoints (Ollama, vLLM, Groq), or the deterministic offline demonstration engine.
-- Self-correction loop: Intercepts SQLite errors, extracts the stack trace, feeds it back into the LLM with the active schema, increments the retry counter, and re-executes.
-- Visualization inference engine: Dynamically configures **Bar**, **Line**, **Area**, **Scatter**, or **Pie** charts based on result dimensionality.
+### Phase 2: LangGraph State Machine & Self-Correction Loop (`agent.py`)
+- **State Machine Topology**: Directed cyclical graph (`generate_query` ➔ `execute_query` ⮂ `self_correct` ➔ `synthesize_and_visualize` ➔ `END`).
+- **Pydantic v2 Output Modeling**: Strictly typed contracts: `SQLQueryOutput`, `SQLCorrectionOutput`, and `VisualizationInsightOutput` with executive `KPIMetric` cards.
+- **Autonomous Error Interception**: Catches SQL dialect and syntax failures, feeds the engine traceback and inspected DDL back to the reflection node, increments the retry counter, and repairs the SQL query (up to 3 automated recovery attempts).
+- **Multi-Dialect Synthesis**: Dialect-aware SQL generation tailored to PostgreSQL (`TO_CHAR`), MySQL (`DATE_FORMAT`), or SQLite (`strftime`).
+- **Dynamic Visualization Mapper**: Automatically maps tabular outputs into optimal Plotly light mode representations: **Bar**, **Line**, **Area**, **Scatter**, **Pie**, or **Table**.
 
-### Phase 3: Comprehensive Test Suite & Benchmarks (`tests/`)
-- 14 automated unit and integration tests covering:
-  - Table existence and foreign key consistency.
-  - Read-only security guards (blocking destructive operations like `DROP` or `DELETE`).
-  - Pydantic schema validation and code sanitization.
-  - LangGraph node execution and routing edge logic.
-  - End-to-end self-correction recovery verification (confirming automatic recovery on intentional syntax errors).
-- Run anytime with: `python -m pytest tests -v` (100% pass rate).
+### Phase 3: Comprehensive Automated Verification Suite (`tests/`)
+- **19 Automated Tests** passing with 100% test coverage across database, agent, state transitions, and pipelines:
+  - `test_database.py`: Table integrity, distribution checks, read-only security guardrails, schema DDL extraction, preview bounds, business KPIs, dynamic engine creation, intelligent schema pruning, query pagination clamping, and connection error handling.
+  - `test_agent.py`: Pydantic schema serialization, markdown SQL block stripping, heuristic generation, individual node contracts, and LangGraph compilation.
+  - `test_pipeline.py`: Clean multi-turn pipeline queries, automated self-correction loop recovery verification, conditional routing edge logic, and end-to-end custom SQLite engine execution.
+- Run anytime with: `python -m pytest tests -v`.
 
-### Phase 4: Executive Streamlit UI/UX Polish (`app.py`)
-- Executive-clean light mode layout (`#F8FAFC`, slate `#0F172A`, `#334155`, soft borders `#E2E8F0`, indigo/blue `#4F46E5` / `#2563EB`).
-- Top Bar KPI summary displaying live enterprise figures ($5.32M revenue, 155 orders, $34.3K AOV).
-- Interactive Database Schema Inspector with row count badges and live 3-row sample table previews.
-- Collapsible **Agent Thought Process Expander**: Exposes real-time agent progression (SQL generation rationale, execution latency in milliseconds, self-correction diagnoses, and visual synthesis decisions).
-- 4-Tab Executive Results Dashboard:
-  - **Tab 1: 📊 Executive Briefing & Visualization**: Actionable takeaways, query KPIs, and interactive Plotly chart with light mode styling.
-  - **Tab 2: 📋 Data Table & Export**: Tabular data preview with one-click CSV and JSON downloads.
+### Phase 4: Executive Streamlit UI/UX & Multi-DB Manager (`app.py`)
+- **Executive Light Mode Aesthetic**: Tailored CSS design system (`#F8FAFC` background, slate typography, subtle `#E2E8F0` borders, indigo/blue accents).
+- **Interactive Database Connection Manager**:
+  1. Default Seeded E-Commerce Database (offline ready).
+  2. Custom SQLite `.db` File Uploader (drag-and-drop instant connection).
+  3. PostgreSQL Parameter Form (Host, Port, Database, User, Password).
+  4. MySQL Parameter Form (Host, Port, Database, User, Password).
+  5. Direct Custom SQLAlchemy URI.
+- **Adaptive KPI Summary Bar**: Dynamically toggles between commercial business metrics (Gross Revenue, Completed Orders, Customer Accounts, AOV) and structural database metrics (Total Tables, Dialect, Total Row Count).
+- **Inspected Schema Explorer**: Interactive accordions detailing column data types, primary key badges (🔑), and 3-row live sample previews.
+- **Collapsible Agent Thought Process Expander**: Real-time observability tracking SQL rationale, dialect targets, millisecond execution benchmarks, error tracebacks, and self-correction fixes.
+- **4-Tab Executive Results Dashboard**:
+  - **Tab 1: 📊 Executive Briefing & Visualization**: Actionable takeaways, query KPIs, and interactive Plotly chart.
+  - **Tab 2: 📋 Data Table & Export**: Data table with one-click CSV and JSON downloads.
   - **Tab 3: 💻 Executed SQL & Query Plan**: Syntax-highlighted SQL with attempt counters and duration metrics.
-  - **Tab 4: 🛠️ Direct SQL Sandbox**: Allows academic evaluators to type their own raw SQL queries directly into the SQLite database to cross-check results.
+  - **Tab 4: 🛠️ Direct SQL Sandbox**: Raw query sandbox allowing evaluators to verify results against the active engine directly.
 
-### Phase 5: Containerization & Launcher Artifacts
-- `Dockerfile` & `docker-compose.yml` for zero-configuration container deployment.
+### Phase 5: Containerization & 1-Click Launchers
+- `Dockerfile` & `docker-compose.yml` for multi-platform container deployment.
 - `run_demo.bat` (Windows 1-click launcher).
 - `run_demo.sh` (Linux/macOS 1-click launcher).
 

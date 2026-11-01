@@ -336,23 +336,40 @@ def heuristic_generate_sql(user_query: str, engine: Optional[Engine] = None) -> 
                 "title": item.get("title")
             }
 
-    # If custom database is active, inspect its first table
+    # If custom database is active, inspect its tables and match user query
     if engine is not None:
         try:
             insp = database.inspect(engine)
             tables = insp.get_table_names()
             if tables:
-                t = tables[0]
+                # Prioritize a table matching the query
+                matched_table = None
+                for tbl in tables:
+                    if tbl.lower() in q_lower or tbl.lower().rstrip("s") in q_lower:
+                        matched_table = tbl
+                        break
+                t = matched_table or tables[0]
                 cols = [c["name"] for c in insp.get_columns(t)]
                 quoted = f'"{t}"' if engine.dialect.name == "postgresql" else f"`{t}`" if engine.dialect.name == "mysql" else t
+
+                num_col = None
+                cat_col = cols[0] if cols else None
+                for c in insp.get_columns(t):
+                    col_type_str = str(c["type"]).upper()
+                    if any(nt in col_type_str for nt in ["INT", "FLOAT", "NUMERIC", "DECIMAL", "REAL", "DOUBLE"]):
+                        if not c["name"].lower().endswith("_id"):
+                            num_col = c["name"]
+                            break
+
+                chart_type = "bar" if num_col else "table"
                 return {
                     "sql": f"SELECT * FROM {quoted} LIMIT 25;",
-                    "rationale": f"Extracted initial preview records from discovered table '{t}' in {engine.dialect.name.upper()} database.",
+                    "rationale": f"Extracted records from discovered table '{t}' in {engine.dialect.name.upper()} database.",
                     "tables": [t],
-                    "chart_type": "table",
-                    "x": cols[0] if cols else None,
-                    "y": None,
-                    "title": f"Preview of {t}"
+                    "chart_type": chart_type,
+                    "x": cat_col,
+                    "y": num_col,
+                    "title": f"Discovered Records from '{t}'"
                 }
         except Exception:
             pass
@@ -420,8 +437,8 @@ def create_agent_nodes(llm: Optional[ChatOpenAI] = None):
         engine: Engine = state.get("db_engine") or database.get_default_engine(state.get("db_path", database.DEFAULT_DB_PATH))
         dialect = engine.dialect.name.upper()
 
-        # Dynamic schema extraction via inspect(engine)
-        schema_str = database.get_engine_schema_string(engine)
+        # Dynamic schema extraction via inspect(engine) with Schema RAG
+        schema_str = database.get_engine_schema_string(engine, user_query=user_query)
         thought_steps = list(state.get("thought_steps", []))
         timestamp = datetime.now().strftime("%H:%M:%S")
 
@@ -559,7 +576,7 @@ CRITICAL RULES:
 
         engine: Engine = state.get("db_engine") or database.get_default_engine(state.get("db_path", database.DEFAULT_DB_PATH))
         dialect = engine.dialect.name.upper()
-        schema_str = database.get_engine_schema_string(engine)
+        schema_str = database.get_engine_schema_string(engine, user_query=user_query)
 
         thought_steps = list(state.get("thought_steps", []))
         timestamp = datetime.now().strftime("%H:%M:%S")

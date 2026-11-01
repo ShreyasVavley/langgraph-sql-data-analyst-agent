@@ -123,5 +123,47 @@ def test_dynamic_sqlalchemy_engine():
     assert dur >= 0.0
 
 
+def test_schema_table_pruning():
+    """Verify intelligent schema pruning when tables exceed threshold."""
+    # Create an in-memory database with 20 tables
+    from sqlalchemy import create_engine, text
+    mem_engine = create_engine("sqlite:///:memory:")
+    with mem_engine.connect() as conn:
+        for i in range(18):
+            conn.execute(text(f"CREATE TABLE dummy_tbl_{i} (id INT, val TEXT);"))
+        conn.execute(text("CREATE TABLE financial_records (record_id INT PRIMARY KEY, revenue REAL, fiscal_year INT);"))
+        conn.execute(text("CREATE TABLE audit_logs (log_id INT PRIMARY KEY, action TEXT, created_at TEXT);"))
+        conn.commit()
+
+    # Query asking about revenue/financial records
+    selected = database.prune_schema_tables(mem_engine, query="What is the total revenue in financial records?", max_tables=5)
+    assert len(selected) <= 5
+    assert "financial_records" in selected
+
+    # Check schema string indicates pruning
+    schema_str = database.get_engine_schema_string(mem_engine, user_query="What is the revenue?", max_tables=5)
+    assert "Schema Pruned" in schema_str
+    assert "CREATE TABLE financial_records" in schema_str
+
+
+def test_query_pagination_clamping():
+    """Verify that execute_engine_query clamps unlimited queries."""
+    engine = database.get_sqlite_engine(TEST_DB_PATH)
+    # Query with no LIMIT
+    df, dur = database.execute_engine_query("SELECT * FROM customers", engine, max_rows=10)
+    assert len(df) <= 10
+    assert dur >= 0.0
+
+
+def test_invalid_connection_handling():
+    """Verify failed connections return graceful tuple without raising unhandled exception."""
+    bad_engine = database.create_custom_engine("sqlite:///nonexistent_dir_12345/unreachable.db")
+    # Even for weird paths or unreachable network hosts, test_engine_connection handles errors gracefully
+    ok, msg = database.test_engine_connection(bad_engine)
+    # Note: SQLite creates files on connect unless directory is invalid
+    assert isinstance(ok, bool)
+    assert isinstance(msg, str)
+
+
 if __name__ == "__main__":
     pytest.main(["-v", "tests/test_database.py"])

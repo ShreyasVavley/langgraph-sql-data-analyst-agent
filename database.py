@@ -19,6 +19,7 @@ import time
 import sqlite3
 import random
 import urllib.parse
+import concurrent.futures
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -122,27 +123,130 @@ def test_engine_connection(engine: Engine) -> Tuple[bool, str]:
 
 
 # =============================================================================
-# 2. Dynamic Schema Introspection using SQLAlchemy inspect(engine)
+# 2. Dynamic Schema Introspection & Schema RAG (Table Pruning)
 # =============================================================================
 
-def get_engine_schema_string(engine: Engine, sample_rows_count: int = 2) -> str:
+STOPWORDS = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't",
+    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+    "can", "could", "did", "do", "does", "doing", "don't", "down", "during", "each", "few", "for",
+    "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him",
+    "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", "me", "more",
+    "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", "only", "or", "other",
+    "our", "ours", "ourselves", "out", "over", "own", "same", "she", "should", "so", "some", "such",
+    "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they",
+    "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "wasn't", "we",
+    "were", "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with", "would",
+    "show", "give", "list", "display", "find", "get", "calculate", "tell", "top", "per", "across", "by"
+}
+
+
+def prune_schema_tables(
+    engine: Engine,
+    query: Optional[str] = None,
+    max_tables: int = 15
+) -> List[str]:
+    """
+    Intelligently selects the most relevant tables for a user query when a database
+    contains a large number of tables (> max_tables), preserving foreign key relationships.
+    If total tables <= max_tables or query is None/empty, returns all table names.
+    """
+    insp = inspect(engine)
+    all_tables = insp.get_table_names()
+
+    if len(all_tables) <= max_tables or not query or not query.strip():
+        return all_tables
+
+    words = re.findall(r"[a-zA-Z0-9_]+", query.lower())
+    tokens = {w for w in words if len(w) > 2 and w not in STOPWORDS}
+
+    if not tokens:
+        return all_tables[:max_tables]
+
+    table_scores: Dict[str, float] = {t: 0.0 for t in all_tables}
+    table_fk_map: Dict[str, set] = {t: set() for t in all_tables}
+
+    for t in all_tables:
+        t_lower = t.lower()
+        # Direct table name matching
+        for token in tokens:
+            if token == t_lower:
+                table_scores[t] += 10.0
+            elif token in t_lower or t_lower in token:
+                table_scores[t] += 5.0
+            elif token.rstrip("s") == t_lower.rstrip("s"):
+                table_scores[t] += 8.0
+
+        # Column matching
+        try:
+            cols = insp.get_columns(t)
+            for c in cols:
+                c_name = c["name"].lower()
+                for token in tokens:
+                    if token == c_name:
+                        table_scores[t] += 4.0
+                    elif token in c_name:
+                        table_scores[t] += 2.0
+                    elif token.rstrip("s") == c_name.rstrip("s"):
+                        table_scores[t] += 3.0
+        except Exception:
+            pass
+
+        # Foreign keys
+        try:
+            fks = insp.get_foreign_keys(t)
+            for fk in fks:
+                ref_tbl = fk.get("referred_table")
+                if ref_tbl and ref_tbl in table_fk_map:
+                    table_fk_map[t].add(ref_tbl)
+                    table_fk_map[ref_tbl].add(t)
+        except Exception:
+            pass
+
+    # FK affinity propagation: Boost tables directly connected to high-scoring tables
+    high_scoring = [t for t, s in table_scores.items() if s > 0]
+    for ht in high_scoring:
+        for neighbor in table_fk_map.get(ht, set()):
+            table_scores[neighbor] += 3.0
+
+    # Sort tables by score descending
+    sorted_tables = sorted(all_tables, key=lambda t: (table_scores[t], t), reverse=True)
+    selected = set(sorted_tables[:max_tables])
+
+    # Preserve natural original ordering from all_tables for predictability
+    return [t for t in all_tables if t in selected]
+
+
+def get_engine_schema_string(
+    engine: Engine,
+    sample_rows_count: int = 2,
+    user_query: Optional[str] = None,
+    max_tables: int = 15
+) -> str:
     """
     Dynamically inspects the connected database and returns a rich, structured
     DDL representation with column types, primary keys, foreign keys, and sample rows.
     Automatically adapts to SQLite, PostgreSQL, and MySQL dialects.
+    Applies Schema RAG / table pruning when database exceeds max_tables.
     """
     insp = inspect(engine)
     dialect_name = engine.dialect.name.upper()
-    table_names = insp.get_table_names()
+    all_table_names = insp.get_table_names()
 
-    if not table_names:
+    if not all_table_names:
         return f"-- {dialect_name} Database: Connected successfully, but no user tables were found."
+
+    total_count = len(all_table_names)
+    table_names = prune_schema_tables(engine, query=user_query, max_tables=max_tables)
+    is_pruned = len(table_names) < total_count
 
     schema_lines = [
         f"-- {dialect_name} Relational Database Schema Definition",
-        f"-- Total Tables Detected: {len(table_names)}",
-        ""
+        f"-- Total Tables Detected: {total_count}",
     ]
+    if is_pruned:
+        schema_lines.append(f"-- Schema Pruned (Schema RAG): Displaying top {len(table_names)} relevant tables for query context.")
+    schema_lines.append("")
 
     with engine.connect() as conn:
         for t in table_names:
@@ -302,10 +406,17 @@ def get_engine_metrics(engine: Engine) -> Dict[str, Any]:
     }
 
 
-def execute_engine_query(sql: str, engine: Engine) -> Tuple[pd.DataFrame, float]:
+def execute_engine_query(
+    sql: str,
+    engine: Engine,
+    timeout_seconds: float = 15.0,
+    max_rows: int = 1000
+) -> Tuple[pd.DataFrame, float]:
     """
     Executes a read-only query against the active SQLAlchemy Engine,
-    benchmarks execution duration in milliseconds, and returns (DataFrame, duration_ms).
+    enforces safety guardrails, query pagination (LIMIT 1000 clamp),
+    and statement execution timeout (15s limit).
+    Returns (DataFrame, duration_ms).
     """
     start_time = time.perf_counter()
 
@@ -313,16 +424,43 @@ def execute_engine_query(sql: str, engine: Engine) -> Tuple[pd.DataFrame, float]
     stripped = sql.strip().upper()
     forbidden_keywords = [
         "DROP", "DELETE", "TRUNCATE", "ALTER", "INSERT", "UPDATE",
-        "REPLACE", "CREATE", "ATTACH", "DETACH", "GRANT", "REVOKE"
+        "REPLACE", "CREATE", "ATTACH", "DETACH", "GRANT", "REVOKE",
+        "EXEC", "EXECUTE", "PRAGMA"
     ]
     first_token = stripped.split()[0] if stripped.split() else ""
-    if first_token in forbidden_keywords or any(f" {kw} " in f" {stripped} " for kw in ["DROP TABLE", "DELETE FROM", "UPDATE "]):
+    if first_token in forbidden_keywords or any(
+        f" {kw} " in f" {stripped} "
+        for kw in ["DROP TABLE", "DELETE FROM", "UPDATE ", "INSERT INTO", "ALTER TABLE"]
+    ):
         raise ValueError(f"Security Alert: Operation '{first_token}' is rejected. Only read-only SELECT queries are allowed.")
 
-    with engine.connect() as conn:
-        df = pd.read_sql_query(text(sql), conn)
-        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-        return df, round(elapsed_ms, 2)
+    # Pagination / Row Limit Clamping Guardrail
+    clean_sql = sql.strip().rstrip(";")
+    has_limit = bool(re.search(r"\bLIMIT\s+\d+", clean_sql, re.IGNORECASE))
+    is_select = clean_sql.upper().startswith("SELECT") or clean_sql.upper().startswith("WITH")
+
+    if not has_limit and is_select:
+        exec_sql = f"{clean_sql}\nLIMIT {max_rows}"
+    else:
+        exec_sql = clean_sql
+
+    def _run_query():
+        with engine.connect() as conn:
+            return pd.read_sql_query(text(exec_sql), conn)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run_query)
+        try:
+            df = future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"Query execution timed out after exceeding {timeout_seconds}s limit.")
+
+    # Ensure DataFrame does not exceed max_rows
+    if len(df) > max_rows:
+        df = df.iloc[:max_rows].copy()
+
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    return df, round(elapsed_ms, 2)
 
 
 # =============================================================================
@@ -564,9 +702,9 @@ def _populate_sample_data(conn: sqlite3.Connection) -> None:
 # 4. Backwards Compatibility Wrappers (for existing tests & scripts)
 # =============================================================================
 
-def get_schema_string(db_path: str = DEFAULT_DB_PATH) -> str:
+def get_schema_string(db_path: str = DEFAULT_DB_PATH, user_query: Optional[str] = None) -> str:
     engine = get_default_engine(db_path)
-    return get_engine_schema_string(engine)
+    return get_engine_schema_string(engine, user_query=user_query)
 
 
 def get_schema_metadata(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
@@ -584,9 +722,14 @@ def get_db_metrics(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
     return get_engine_metrics(engine)
 
 
-def execute_query(sql: str, db_path: str = DEFAULT_DB_PATH) -> Tuple[pd.DataFrame, float]:
+def execute_query(
+    sql: str,
+    db_path: str = DEFAULT_DB_PATH,
+    timeout_seconds: float = 15.0,
+    max_rows: int = 1000
+) -> Tuple[pd.DataFrame, float]:
     engine = get_default_engine(db_path)
-    return execute_engine_query(sql, engine)
+    return execute_engine_query(sql, engine, timeout_seconds=timeout_seconds, max_rows=max_rows)
 
 
 if __name__ == "__main__":
