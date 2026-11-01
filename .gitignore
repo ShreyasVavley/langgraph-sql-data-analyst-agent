@@ -21,6 +21,11 @@ htmlcov/
 test_*.db
 *.log
 
+# Presentations & Notes (Excluded from Git Repo)
+*.pptx
+notes/
+docs/notes/
+
 # Environment variables
 .env
 .env.local
