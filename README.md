@@ -157,6 +157,11 @@ docker-compose up --build
 ```
 Navigate to `http://localhost:8501`.
 
+### Option D: Streamlit Community Cloud (24/7 Always Active)
+- Deploy with 1 click using the badge at the top of the repository.
+- **Automated Keep-Alive**: An automated GitHub Actions cron workflow (`.github/workflows/keep_alive.yml`) runs every 6 hours to ping your app and prevent Streamlit Cloud from entering sleep mode.
+- To configure your specific URL: In GitHub, go to **Settings > Secrets and variables > Actions** and add `STREAMLIT_APP_URL` (e.g., `https://your-subdomain.streamlit.app`).
+
 ---
 
 ## 🧪 Demonstration Guide for Evaluators

@@ -1,0 +1,41 @@
+name: Keep Streamlit App Active
+
+on:
+  schedule:
+    # Runs every 6 hours to prevent Streamlit Cloud from going to sleep
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: 'Target Streamlit App URL to ping (optional)'
+        required: false
+        default: ''
+
+jobs:
+  ping-streamlit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine Target URL
+        id: resolve-url
+        run: |
+          TARGET="${{ inputs.app_url }}"
+          if [ -z "$TARGET" ]; then
+            TARGET="${{ secrets.STREAMLIT_APP_URL }}"
+          fi
+          if [ -z "$TARGET" ]; then
+            TARGET="https://langgraph-sql-data-analyst-agent.streamlit.app"
+          fi
+          echo "url=$TARGET" >> $GITHUB_OUTPUT
+          echo "Target Streamlit URL: $TARGET"
+
+      - name: Ping Streamlit App
+        run: |
+          TARGET="${{ steps.resolve-url.outputs.url }}"
+          echo "Sending keep-alive ping to $TARGET..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 30 "$TARGET" || echo "000")
+          echo "HTTP Response Status Code: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
+            echo "✅ Streamlit app is awake and responding!"
+          else
+            echo "ℹ️ Returned HTTP $HTTP_STATUS. (If this is expected during initial deployment or custom domain setup, configure the STREAMLIT_APP_URL secret in GitHub repository settings)."
+          fi
