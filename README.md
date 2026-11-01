@@ -4,6 +4,7 @@
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2%2B-indigo.svg)](https://github.com/langchain-ai/langgraph)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.40%2B-FF4B4B.svg)](https://streamlit.io/)
 [![Tests](https://img.shields.io/badge/Tests-14%2F14%20Passing-emerald.svg)]()
+[![Deploy to Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/deploy?repository=ShreyasVavley/langgraph-sql-data-analyst-agent&branch=main&mainModule=app.py)
 [![License](https://img.shields.io/badge/License-MIT-slate.svg)]()
 
 A production-ready, highly polished **Natural Language to SQL Data Analyst Agent** built with **Python**, **LangGraph**, **Pandas**, **Plotly**, and **Streamlit**. Engineered specifically for high-stakes live demonstrations to academic evaluators and enterprise clients. Features a crisp **executive-clean light mode UI** (`#F8FAFC`, slate typography, indigo accents), transparent multi-step reasoning, and an autonomous **self-correction loop** that dynamically intercepts SQL syntax/runtime errors and heals them using LangGraph state transitions.
