@@ -193,28 +193,81 @@ section[data-testid="stSidebar"] .block-container {
     border-left-color: #10B981;
 }
 
-/* Primary Action Buttons */
-div.stButton > button:first-child {
-    background: linear-gradient(135deg, #4F46E5 0%, #3B82F6 100%);
+/* Main content Primary Action Buttons */
+section.main div.stButton > button,
+div[data-testid="stMainBlockContainer"] div.stButton > button {
+    background: linear-gradient(135deg, #4F46E5 0%, #3B82F6 100%) !important;
     color: #FFFFFF !important;
-    font-weight: 600;
-    border: none;
-    border-radius: 8px;
-    padding: 0.55rem 1.25rem;
-    box-shadow: 0 2px 4px rgba(79, 70, 229, 0.2);
-    transition: all 0.2s ease-in-out;
+    font-weight: 600 !important;
+    border: none !important;
+    border-radius: 8px !important;
+    padding: 0.55rem 1.25rem !important;
+    box-shadow: 0 2px 4px rgba(79, 70, 229, 0.2) !important;
+    transition: all 0.2s ease-in-out !important;
 }
-div.stButton > button:first-child:hover {
-    background: linear-gradient(135deg, #4338CA 0%, #2563EB 100%);
-    box-shadow: 0 4px 8px rgba(79, 70, 229, 0.3);
-    transform: translateY(-1px);
+section.main div.stButton > button:hover,
+div[data-testid="stMainBlockContainer"] div.stButton > button:hover {
+    background: linear-gradient(135deg, #4338CA 0%, #2563EB 100%) !important;
+    box-shadow: 0 4px 8px rgba(79, 70, 229, 0.3) !important;
+    transform: translateY(-1px) !important;
 }
 
-/* Secondary Action Buttons */
+/* Sidebar Prompt & Navigation Buttons */
+section[data-testid="stSidebar"] div.stButton > button {
+    background: #F1F5F9 !important;
+    background-color: #F1F5F9 !important;
+    color: #0F172A !important;
+    border: 1px solid #CBD5E1 !important;
+    border-radius: 8px !important;
+    font-size: 0.84rem !important;
+    font-weight: 500 !important;
+    padding: 0.45rem 0.8rem !important;
+    text-align: left !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03) !important;
+    transition: all 0.15s ease-in-out !important;
+    justify-content: flex-start !important;
+    line-height: 1.35 !important;
+}
+
+section[data-testid="stSidebar"] div.stButton > button p {
+    color: inherit !important;
+    font-size: 0.84rem !important;
+    font-weight: 500 !important;
+    text-align: left !important;
+}
+
+section[data-testid="stSidebar"] div.stButton > button:hover {
+    background: #EEF2FF !important;
+    background-color: #EEF2FF !important;
+    color: #2563EB !important;
+    border-color: #3B82F6 !important;
+    box-shadow: 0 2px 6px rgba(37, 99, 235, 0.12) !important;
+    transform: translateY(-1px) !important;
+}
+
+section[data-testid="stSidebar"] div.stButton > button:active {
+    background: #E0E7FF !important;
+    background-color: #E0E7FF !important;
+    color: #1D4ED8 !important;
+    border-color: #2563EB !important;
+    transform: translateY(0px) !important;
+}
+
+/* Secondary & Download Action Buttons */
+div.stDownloadButton > button,
 div.stButton > button[kind="secondary"] {
     background-color: #F8FAFC !important;
     color: #334155 !important;
-    border: 1px solid var(--border-color) !important;
+    border: 1px solid #CBD5E1 !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    transition: all 0.15s ease-in-out !important;
+}
+div.stDownloadButton > button:hover,
+div.stButton > button[kind="secondary"]:hover {
+    background-color: #EEF2FF !important;
+    color: #2563EB !important;
+    border-color: #3B82F6 !important;
 }
 
 /* Streamlit Expander styling */
