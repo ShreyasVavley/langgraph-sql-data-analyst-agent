@@ -23,6 +23,7 @@ test_*.db
 
 # Presentations & Notes (Excluded from Git Repo)
 *.pptx
+generate_pptx.py
 notes/
 docs/notes/
 
