@@ -308,10 +308,18 @@ with st.sidebar:
         selected_model = "gpt-4o-mini"
 
         if provider == "OpenAI / Direct Key":
+            # Check environment variables and Streamlit Cloud secrets
+            default_key = os.getenv("OPENAI_API_KEY", "")
+            if not default_key:
+                try:
+                    default_key = st.secrets.get("OPENAI_API_KEY", "")
+                except Exception:
+                    pass
+
             api_key_input = st.text_input(
                 "OpenAI API Key",
                 type="password",
-                value=os.getenv("OPENAI_API_KEY", ""),
+                value=default_key,
                 help="Key used for Pydantic structured output generation."
             )
             selected_model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"], index=0)
